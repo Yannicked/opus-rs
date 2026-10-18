@@ -51,6 +51,31 @@ fn voiced(sr: usize, n: usize) -> Vec<f32> {
     out
 }
 
+/// Broadband stereo test signal (interleaved): a 180 Hz harmonic series
+/// under 100 ms noise bursts every 300 ms, so every CELT band carries energy.
+/// The right channel is the left, scaled.
+fn broadband(sr: usize, n: usize) -> Vec<f32> {
+    let mut seed = 0x2468_ace1u32;
+    let mut out = Vec::with_capacity(n * 2);
+    for i in 0..n {
+        let t = i as f32 / sr as f32;
+        let tone: f32 = (1..=12)
+            .map(|h| (2.0 * PI * 180.0 * h as f32 * t).sin() * 0.3 / h as f32)
+            .sum();
+        seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+        let noise = ((seed >> 9) as f32 / (1u32 << 23) as f32 - 0.5) * 2.0;
+        let burst = if (i / (sr / 10)).is_multiple_of(3) {
+            0.3
+        } else {
+            0.02
+        };
+        let l = tone + noise * burst;
+        out.push(l);
+        out.push(0.8 * l);
+    }
+    out
+}
+
 /// A libopus coding mode, pinned so that switching channels can't move it.
 struct Mode {
     name: &'static str,
@@ -62,6 +87,8 @@ struct Mode {
     configs: RangeInclusive<u8>,
     /// Worst 20 ms window SNR (dB) against libopus's decode.
     floor: f64,
+    /// The stereo input, from the rate and the samples per channel.
+    signal: fn(usize, usize) -> Vec<f32>,
 }
 
 /// SILK decodes bit-exactly with libopus, so its bar sits far above any real
@@ -69,9 +96,9 @@ struct Mode {
 const SILK_FLOOR: f64 = 100.0;
 
 /// With matching channel counts, opus-rs's CELT decode agrees with libopus's
-/// to 47.6-51.4 dB on these streams, and Hybrid's at 48 kHz to 55.7-60.1 dB
-/// (bit-exact at 16 kHz, where only the SILK layer is heard). The bars leave
-/// margin below that.
+/// to 45.3-51.4 dB on these streams (stereo CELT sets the low end), and
+/// Hybrid's at 48 kHz to 55.7-60.1 dB (bit-exact at 16 kHz, where only the
+/// SILK layer is heard). The bars leave margin below that.
 const CELT_FLOOR: f64 = 40.0;
 const HYBRID_FLOOR: f64 = 45.0;
 
@@ -83,6 +110,7 @@ const SILK_WB: Mode = Mode {
     ms: 20,
     configs: 8..=11,
     floor: SILK_FLOOR,
+    signal: voiced,
 };
 
 /// Three SILK frames per packet: a switch lands on the packet's first frame.
@@ -94,6 +122,7 @@ const SILK_WB_60: Mode = Mode {
     ms: 60,
     configs: 8..=11,
     floor: SILK_FLOOR,
+    signal: voiced,
 };
 
 const HYBRID_FB: Mode = Mode {
@@ -104,6 +133,7 @@ const HYBRID_FB: Mode = Mode {
     ms: 20,
     configs: 14..=15,
     floor: HYBRID_FLOOR,
+    signal: voiced,
 };
 
 const CELT_FB: Mode = Mode {
@@ -114,9 +144,23 @@ const CELT_FB: Mode = Mode {
     ms: 20,
     configs: 28..=31,
     floor: CELT_FLOOR,
+    signal: voiced,
 };
 
 const MODES: [&Mode; 4] = [&SILK_WB, &SILK_WB_60, &HYBRID_FB, &CELT_FB];
+
+/// CELT at whatever bandwidth the packet asks for. A broadband signal: the
+/// voiced one barely reaches the upper bands, whose energies are at stake.
+const CELT_ANY: Mode = Mode {
+    name: "CELT, bandwidth steps",
+    app: CApp::LowDelay,
+    bandwidth: CBw::Fullband,
+    bitrate: 64000,
+    ms: 20,
+    configs: 16..=31,
+    floor: CELT_FLOOR,
+    signal: broadband,
+};
 
 fn frame_duration(ms: usize) -> FrameSize {
     match ms {
@@ -131,12 +175,12 @@ fn is_stereo(pkt: &[u8]) -> bool {
 }
 
 /// 2 s of libopus stereo-encoded packets in `mode`. `plan(p)` gives packet
-/// `p`'s forced channel count (`None` lets libopus choose) and bitrate.
-fn libopus_packets(mode: &Mode, plan: impl Fn(usize) -> (Option<CCh>, i32)) -> Vec<Vec<u8>> {
+/// `p`'s forced channel count (`None` lets libopus choose), bitrate and
+/// bandwidth.
+fn libopus_packets(mode: &Mode, plan: impl Fn(usize) -> (Option<CCh>, i32, CBw)) -> Vec<Vec<u8>> {
     let frame = SR * mode.ms / 1000;
-    let input = voiced(SR, 2 * SR);
+    let input = (mode.signal)(SR, 2 * SR);
     let mut enc = CEnc::new(SR as u32, CCh::Stereo, mode.app).unwrap();
-    enc.set_bandwidth(mode.bandwidth).unwrap();
     // A steady harmonic tone can read as music and pull libopus into CELT.
     enc.set_signal(CSignal::Voice).unwrap();
     enc.set_complexity(9).unwrap();
@@ -147,9 +191,10 @@ fn libopus_packets(mode: &Mode, plan: impl Fn(usize) -> (Option<CCh>, i32)) -> V
         .chunks_exact(frame * 2)
         .enumerate()
         .map(|(p, f)| {
-            let (channels, bitrate) = plan(p);
+            let (channels, bitrate, bandwidth) = plan(p);
             enc.set_force_channels(channels).unwrap();
             enc.set_bitrate(CBitrate::Bits(bitrate)).unwrap();
+            enc.set_bandwidth(bandwidth).unwrap();
             let n = enc.encode_float(f, &mut pkt).unwrap();
             let config = pkt[0] >> 3;
             assert!(
@@ -260,7 +305,7 @@ fn assert_agrees_with_libopus(
 #[test]
 fn stereo_decoder_plays_mono_packets_on_both_channels() {
     for mode in MODES {
-        let packets = libopus_packets(mode, |_| (Some(CCh::Mono), mode.bitrate));
+        let packets = libopus_packets(mode, |_| (Some(CCh::Mono), mode.bitrate, mode.bandwidth));
         assert!(
             packets.iter().all(|p| !is_stereo(p)),
             "{}: stereo ToC",
@@ -290,7 +335,7 @@ fn stereo_decoder_plays_mono_packets_on_both_channels() {
 #[test]
 fn mono_decoder_downmixes_stereo_packets() {
     for mode in MODES {
-        let packets = libopus_packets(mode, |_| (Some(CCh::Stereo), mode.bitrate));
+        let packets = libopus_packets(mode, |_| (Some(CCh::Stereo), mode.bitrate, mode.bandwidth));
         assert!(
             packets.iter().all(|p| is_stereo(p)),
             "{}: mono ToC",
@@ -314,7 +359,7 @@ fn channel_switches_decode_like_libopus() {
             } else {
                 CCh::Mono
             };
-            (Some(channels), mode.bitrate)
+            (Some(channels), mode.bitrate, mode.bandwidth)
         });
         let switches = channel_switches(&packets);
         assert!(switches >= 8, "{}: {switches} channel switches", mode.name);
@@ -332,7 +377,7 @@ fn channel_switches_decode_like_libopus() {
 fn low_bitrate_stereo_stream_from_libopus() {
     let packets = libopus_packets(&SILK_WB, |p| {
         let bitrate = if (30..70).contains(&p) { 12000 } else { 32000 };
-        (None, bitrate)
+        (None, bitrate, SILK_WB.bandwidth)
     });
     let mono = packets.iter().filter(|p| !is_stereo(p)).count();
     assert!(mono > 0, "libopus sent no mono packet at 12 kb/s");
@@ -340,6 +385,41 @@ fn low_bitrate_stereo_stream_from_libopus() {
     for rate in [16000, 48000] {
         for ch in [2, 1] {
             assert_agrees_with_libopus(&SILK_WB, "12 kb/s dip", &packets, ch, rate);
+        }
+    }
+}
+
+/// CELT whose bandwidth steps every 100 ms, so each frame codes a different
+/// band range. A frame clears the energies of the bands it doesn't code, in
+/// both halves as libopus does (`celt_decoder.c`, from PR #59). A mono stream
+/// keeps the second half, and its next frame predicts from the larger of the
+/// two. Clearing only the coded channel's half left stale energies there, and
+/// the next wider frame decoded its new bands from them: noise, at -0.9 dB.
+#[test]
+fn celt_bandwidth_steps_decode_like_libopus() {
+    // Each bandwidth and its first CELT ToC configuration.
+    const STEPS: [(CBw, u8); 4] = [
+        (CBw::Fullband, 28),
+        (CBw::Wideband, 20),
+        (CBw::Superwideband, 24),
+        (CBw::Narrowband, 16),
+    ];
+    for (channels, what) in [(CCh::Mono, "mono stream"), (CCh::Stereo, "stereo stream")] {
+        let packets = libopus_packets(&CELT_ANY, |p| {
+            (Some(channels), CELT_ANY.bitrate, STEPS[(p / 5) % 4].0)
+        });
+        for (p, pkt) in packets.iter().enumerate() {
+            let first = STEPS[(p / 5) % 4].1;
+            let config = pkt[0] >> 3;
+            assert!(
+                (first..first + 4).contains(&config),
+                "{what}: packet {p} has ToC config {config}"
+            );
+        }
+        for rate in [16000, 48000] {
+            for ch in [1, 2] {
+                assert_agrees_with_libopus(&CELT_ANY, what, &packets, ch, rate);
+            }
         }
     }
 }

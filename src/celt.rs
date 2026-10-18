@@ -3911,8 +3911,9 @@ impl CeltDecoder {
             }
         }
         // In case start or end change (libopus celt_decoder.c), the bands this frame didn't code
-        // forget their energy and history.
-        for c in 0..channels {
+        // forget their energy and history. Both halves, as libopus clears them: a mono stream
+        // keeps the second, and its next frame predicts from the larger of the two.
+        for c in 0..CELT_MAX_CHANNELS {
             for i in (0..start_band).chain(end_band..nb_ebands) {
                 self.old_band_e[c * nb_ebands + i] = 0.0;
                 self.old_band_e2[c * nb_ebands + i] = -28.0;

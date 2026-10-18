@@ -195,7 +195,10 @@ Measured on Apple Silicon M-series (aarch64), compiled with `--release` (opt-lev
   against libopus in every case, switches included. CELT and Hybrid agree
   with libopus as closely as when the channel counts match (47-62 dB).
   Streams whose channel count matches the decoder's decode exactly as
-  before.
+  before. CELT's clearing of the bands a frame doesn't code (#59) now covers
+  both halves of the energy state, as libopus's does. A mono stream keeps
+  the second half, and stale energies there made a wider frame decode its
+  new bands as noise (-0.9 dB against libopus).
 
 ### 0.1.37
 
