@@ -62,10 +62,15 @@ impl SilkDecoder {
 
         self.channel_state[0].n_frames_per_packet = 1;
         self.n_channels_api = channels;
+        // libopus starts the internal count at 0; starting at the API count
+        // differs only in a first call's channel switch, which then resets
+        // state that is still fresh.
         self.n_channels_internal = channels;
         ret
     }
 
+    /// Decode one frame with the channel count used last time; see
+    /// [`Self::decode_with_channels`]. Concealment keeps that count.
     pub fn decode(
         &mut self,
         range_dec: &mut RangeCoder,
@@ -75,10 +80,45 @@ impl SilkDecoder {
         payload_size_ms: i32,
         internal_sample_rate: i32,
     ) -> i32 {
+        self.decode_with_channels(
+            range_dec,
+            output,
+            lost_flag,
+            new_packet,
+            payload_size_ms,
+            internal_sample_rate,
+            self.n_channels_internal,
+        )
+    }
+
+    /// Decode one frame coded with `n_channels_internal` channels (the
+    /// packet's), for `n_channels_api` output channels (libopus
+    /// `silk_Decode`). Output is planar at the internal rate, with
+    /// `min(n_channels_api, n_channels_internal)` channels: a mono decoder
+    /// gets the mid of a stereo stream, and a mono stream in a stereo decoder
+    /// leaves the second channel to the caller.
+    #[allow(clippy::too_many_arguments)]
+    pub fn decode_with_channels(
+        &mut self,
+        range_dec: &mut RangeCoder,
+        output: &mut [i16],
+        lost_flag: i32,
+        new_packet: bool,
+        payload_size_ms: i32,
+        internal_sample_rate: i32,
+        n_channels_internal: i32,
+    ) -> i32 {
         if new_packet {
             self.channel_state[0].n_frames_decoded = 0;
             self.channel_state[1].n_frames_decoded = 0;
         }
+
+        // A mono -> stereo switch starts the side channel from scratch.
+        if n_channels_internal > self.n_channels_internal {
+            silk_init_decoder(&mut self.channel_state[1]);
+        }
+        let prev_channels_internal = self.n_channels_internal;
+        self.n_channels_internal = n_channels_internal;
 
         if self.channel_state[0].n_frames_decoded == 0 {
             let n_channels = self.n_channels_internal as usize;
@@ -122,9 +162,12 @@ impl SilkDecoder {
             }
         }
 
-        // libopus clears the stereo predictor state only on a mono->stereo
-        // change of the internal channel count (dec_API.c). Here the count is
-        // fixed by `init()`, so the state carries over from frame to frame.
+        // libopus clears the stereo predictor state only when a stereo
+        // decoder's stream turns from mono to stereo (dec_API.c).
+        if self.n_channels_api == 2 && n_channels_internal == 2 && prev_channels_internal == 1 {
+            self.s_stereo.pred_prev_q13 = [0; 2];
+            self.s_stereo.s_side = [0; 2];
+        }
 
         if lost_flag != FLAG_PACKET_LOST && self.channel_state[0].n_frames_decoded == 0 {
             let n_frames_per_packet = self.channel_state[0].n_frames_per_packet.max(1);
@@ -280,8 +323,11 @@ impl SilkDecoder {
             self.channel_state[n].n_frames_decoded += 1;
         }
 
-        // Convert Mid/Side → Left/Right for stereo, or do mono buffering.
-        if n_channels == 2 {
+        // Convert Mid/Side → Left/Right for stereo output of a stereo
+        // stream. Otherwise buffer the mid alone: a mono decoder plays the
+        // mid of a stereo stream (dec_API.c).
+        let stereo_out = self.n_channels_api == 2 && n_channels == 2;
+        if stereo_out {
             let (buf_l, buf_r) = self.w_silk_buf.split_at_mut(1);
             silk_stereo_ms_to_lr(
                 &mut self.s_stereo,
@@ -306,7 +352,7 @@ impl SilkDecoder {
         // one-sample-delayed position. Mono used to read from [2..2+fl], which
         // made it one internal-rate sample early versus libopus (issue #34).
         let fl = n_samples_out as usize;
-        if n_channels == 2 {
+        if stereo_out {
             if output.len() < 2 * fl {
                 return -1;
             }

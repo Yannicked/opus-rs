@@ -1801,6 +1801,11 @@ impl OpusDecoder {
     /// packet to conceal the duration that ToC describes. Either way the
     /// frame is concealed in the previous packet's mode; the placeholder's
     /// mode, bandwidth and channel bits are ignored.
+    ///
+    /// A packet's channel count need not match the decoder's, as in libopus:
+    /// a stereo decoder plays a mono packet on both channels, and a mono
+    /// decoder downmixes a stereo packet (SILK plays the mid). libopus
+    /// encoders send mono packets in stereo streams at low bitrates.
     pub fn decode(
         &mut self,
         input: &[u8],
@@ -1818,10 +1823,6 @@ impl OpusDecoder {
         let packet_channels = channels_from_toc(toc);
         let bandwidth = bandwidth_from_toc(toc);
         let frame_duration_ms = frame_duration_ms_from_toc(toc);
-
-        if packet_channels != self.channels {
-            return Err("Channel count mismatch between packet and decoder");
-        }
 
         let code = toc & 0x03;
         let frame_count: usize;
@@ -1952,7 +1953,6 @@ impl OpusDecoder {
 
         self.frame_size = frame_size;
         self.bandwidth = bandwidth;
-        self.stream_channels = packet_channels;
 
         // Derive the actual per-frame sample count from the TOC, not from the
         // caller's frame_size. This prevents panics in bands.rs/celt.rs when
@@ -1967,6 +1967,9 @@ impl OpusDecoder {
         if output.len() < decoded_total * self.channels {
             return Err("Output buffer too small for packet");
         }
+        // The packet's channel count steers both layers from here on.
+        self.stream_channels = packet_channels;
+        self.celt_dec.set_stream_channels(packet_channels);
         // Zero-fill any extra space the caller provided beyond what the packet
         // actually produces, so stale data is never left in the buffer.
         if output.len() > decoded_total * self.channels {
@@ -2020,10 +2023,14 @@ impl OpusDecoder {
                 let bridge_ch = f5_bridge * self.channels;
                 let bridge_len = bridge_ch.min(self.prev_pcm_tail.len());
                 if internal_rate == self.sampling_rate {
-                    // No resampling: copy PLC samples directly (ch0 planar).
+                    // No resampling: copy PLC samples directly (planar). A
+                    // mono stream fills both channels of a stereo decoder.
                     let n_us = n as usize;
+                    let silk_channels = self
+                        .channels
+                        .min(self.silk_dec.n_channels_internal as usize);
                     for ch in 0..self.channels {
-                        let src_base = ch * n_us;
+                        let src_base = ch.min(silk_channels - 1) * n_us;
                         for i in 0..(bridge_len / self.channels).min(n_us) {
                             let dst = i * self.channels + ch;
                             if dst < bridge_len {
@@ -2452,18 +2459,42 @@ impl OpusDecoder {
         let mut frame_pos = 0usize; // internal-rate samples decoded so far
         let mut new_packet = true;
         while frame_pos < internal_frame_size {
+            // libopus takes the channel count from the packet only when there
+            // is data; concealment keeps the last frame's.
+            let prev_channels = self.silk_dec.n_channels_internal as usize;
+            let stream_channels = if lost_flag == silk::decode_frame::FLAG_PACKET_LOST {
+                prev_channels
+            } else {
+                self.stream_channels
+            };
+            // libopus keeps a resampler per SILK channel (dec_API.c). When a
+            // stereo decoder's stream turns stereo, the right one starts from
+            // the left's. The first mono frame after stereo, at an unchanged
+            // rate, still resamples the right channel with its own; libopus
+            // resets SILK after CELT, so that frame never follows CELT there.
+            if self.channels == 2 && stream_channels == 2 && prev_channels == 1 {
+                self.silk_resampler_2 = self.silk_resampler.clone();
+            }
+            let stereo_to_mono = stream_channels == 1
+                && prev_channels == 2
+                && internal_rate == self.silk_dec.sample_rate()
+                && matches!(
+                    self.prev_mode,
+                    Some(OpusMode::SilkOnly) | Some(OpusMode::Hybrid)
+                );
             let ret = {
                 let (silk_dec, pcm_i16) = (
                     state_mut(&mut self.silk_dec),
                     state_mut(&mut self.w_pcm_i16),
                 );
-                silk_dec.decode(
+                silk_dec.decode_with_channels(
                     rc,
                     &mut pcm_i16[..pcm_i16_len],
                     lost_flag,
                     new_packet,
                     duration_ms,
                     internal_rate,
+                    stream_channels as i32,
                 )
             };
             new_packet = false;
@@ -2502,18 +2533,28 @@ impl OpusDecoder {
                     decoded_samples as i32,
                 );
             }
-            // Resample channel 1 (stereo only).
+            // Channel 1 (stereo output only). A mono stream is copied from
+            // channel 0, except on the frame that collapses stereo to mono.
             if self.channels == 2 {
                 let (res, inp, out) = (
                     &mut self.silk_resampler_2,
                     state_ref(&self.w_pcm_i16),
                     state_mut(&mut self.w_pcm_resampled),
                 );
-                res.process(
-                    &mut out[resampled_len..2 * resampled_len],
-                    &inp[decoded_samples..2 * decoded_samples],
-                    decoded_samples as i32,
-                );
+                if stream_channels == 2 || stereo_to_mono {
+                    let src = if stream_channels == 2 {
+                        &inp[decoded_samples..2 * decoded_samples]
+                    } else {
+                        &inp[..decoded_samples]
+                    };
+                    res.process(
+                        &mut out[resampled_len..2 * resampled_len],
+                        src,
+                        decoded_samples as i32,
+                    );
+                } else {
+                    out.copy_within(..resampled_len, resampled_len);
+                }
             }
             for i in 0..copy_len {
                 for ch in 0..self.channels {
