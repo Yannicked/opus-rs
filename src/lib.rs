@@ -1986,8 +1986,29 @@ impl OpusDecoder {
             self.prev_mode,
             Some(prev) if prev != mode && !self.prev_redundancy
         );
-        // A Hybrid frame resets CELT itself, after a CELT-to-SILK redundant frame is decoded from the old state
-        // (libopus opus_decode_frame).
+        // The transitions libopus's opus_decode_frame bridges with 5 ms of the old mode concealed
+        // forward: into CELT from SILK or Hybrid (unless that frame's redundancy did it), and out of CELT. A Hybrid
+        // frame carrying redundancy clears it below (libopus: `if (redundancy) transition = 0`).
+        let mut transition = match self.prev_mode {
+            Some(prev) => {
+                (mode == OpusMode::CeltOnly && prev != OpusMode::CeltOnly && !self.prev_redundancy)
+                    || (mode != OpusMode::CeltOnly && prev == OpusMode::CeltOnly)
+            }
+            None => false,
+        };
+        let from_celt = self.prev_mode == Some(OpusMode::CeltOnly) && mode != OpusMode::CeltOnly;
+        if from_celt {
+            // SILK starts over, as libopus's silk_ResetDecoder on a switch from CELT (its resampler too: the reset
+            // clears the SILK rate, so the next set_fs initialises it again).
+            self.silk_dec.reset();
+            self.prev_internal_rate = 0;
+        }
+        // Out of CELT into SILK only, the bridge is the old CELT state concealed forward (a Hybrid frame decides once
+        // its redundancy is read), not the previous frame's last 5 ms, which already played.
+        if from_celt && mode == OpusMode::SilkOnly {
+            self.conceal_celt_bridge()?;
+        }
+        // A Hybrid frame resets CELT itself, after a CELT-to-SILK redundant frame is decoded from the old state.
         if mode_transition && mode != OpusMode::Hybrid {
             self.celt_dec.reset_state();
         }
@@ -1997,7 +2018,8 @@ impl OpusDecoder {
         // (opus_decoder.c:387-391) and crossfades it with the new frame. We
         // reuse the F5-sized prev_pcm_tail buffer for this bridge.
         let f5_bridge = self.sampling_rate as usize / 200; // F5 = Fs/200
-        if mode_transition
+        if transition
+            && mode == OpusMode::CeltOnly
             && f5_bridge > 0
             && matches!(
                 self.prev_mode,
@@ -2221,6 +2243,13 @@ impl OpusDecoder {
                     let f5 = self.sampling_rate as usize / 200;
                     let f2_5 = f5 / 2;
                     let mut redundant = [0.0f32; REDUNDANT_MAX];
+                    if fi == 0 {
+                        if redundancy {
+                            transition = false;
+                        } else if from_celt {
+                            self.conceal_celt_bridge()?;
+                        }
+                    }
                     if redundancy && celt_to_silk {
                         self.decode_redundant(
                             &payload[len..len + redundancy_bytes],
@@ -2332,7 +2361,7 @@ impl OpusDecoder {
         // F5 = Fs/200, F2_5 = Fs/400.
         let f2_5 = self.sampling_rate as usize / 400;
         let f5 = f2_5 * 2;
-        if mode_transition && f5 > 0 && decoded_total >= f5 {
+        if transition && f5 > 0 && decoded_total >= f5 {
             let window = modes::default_mode().window;
             let inc = (48000 / self.sampling_rate) as usize;
             let f2_5_ch = f2_5 * self.channels;
@@ -2466,6 +2495,21 @@ impl OpusDecoder {
 
         self.save_pcm_tail(output, total);
         Ok(total)
+    }
+
+    /// 5 ms of the old CELT state concealed forward, the bridge out of CELT (libopus
+    /// opus_decode_frame's `pcm_transition`), into `prev_pcm_tail`.
+    fn conceal_celt_bridge(&mut self) -> Result<(), &'static str> {
+        let f5 = self.sampling_rate as usize / 200;
+        if f5 == 0 {
+            return Ok(());
+        }
+        self.conceal_celt(f5, 0)?;
+        let n = (f5 * self.channels).min(self.prev_pcm_tail.len());
+        for i in 0..n {
+            self.prev_pcm_tail[i] = self.w_celt_out[i].clamp(-1.0, 1.0);
+        }
+        Ok(())
     }
 
     /// CELT concealment for `n` samples: decode an empty payload, which takes
