@@ -2015,13 +2015,16 @@ impl OpusDecoder {
             self.silk_dec.reset();
             self.prev_internal_rate = 0;
         }
-        // Out of CELT into SILK only, the bridge is the old CELT state concealed forward (a Hybrid frame decides once
-        // its redundancy is read), not the previous frame's last 5 ms, which already played.
-        if from_celt && mode == OpusMode::SilkOnly {
-            self.conceal_celt_bridge()?;
-        }
-        // A Hybrid frame resets CELT itself, after a CELT-to-SILK redundant frame is decoded from the old state.
-        if mode_transition && mode != OpusMode::Hybrid {
+        // A SILK-only frame decides its out-of-CELT bridge only after its SILK
+        // layer runs: when the frame carries a redundancy tail there is nothing
+        // to bridge (libopus: `if (redundancy) transition = 0`), and without one
+        // the old CELT state conceals forward from inside the branch below.
+        // Only a switch into CELT resets CELT here (libopus's reset at
+        // opus_decode_frame 551-553 sits inside `mode != MODE_SILK_ONLY`): a
+        // Hybrid frame resets it after its CELT-to-SILK redundant frame is
+        // decoded from the old state, and a SILK-only frame resets it right
+        // before its own redundant frame, if it carries one.
+        if mode_transition && mode == OpusMode::CeltOnly {
             self.celt_dec.reset_state();
         }
 
@@ -2121,6 +2124,20 @@ impl OpusDecoder {
                 // needed, e.g. 16kHz decoder + SILK WB).
                 self.prev_internal_rate = internal_sample_rate;
 
+                // 5 ms redundant frames and their crossfade window, shared by
+                // every frame of the packet. The redundant frame ends where
+                // the packet's bandwidth does (libopus 499-524): narrowband
+                // 13, mediumband and wideband 17.
+                let f5 = self.sampling_rate as usize / 200;
+                let f2_5 = f5 / 2;
+                let redundant_end_band = match bandwidth {
+                    Bandwidth::Narrowband => 13,
+                    Bandwidth::Mediumband | Bandwidth::Wideband => 17,
+                    _ => 21,
+                };
+                let window = modes::default_mode().window;
+                let inc = (48000 / self.sampling_rate) as usize;
+
                 for (fi, payload) in frame_payloads.iter().enumerate() {
                     let out_start = fi * sub_output_len;
                     // C opus_decode_frame: a zero-length frame (e.g. the
@@ -2141,6 +2158,106 @@ impl OpusDecoder {
                     )?;
                     output[out_start..out_start + sub_output_len]
                         .copy_from_slice(&self.w_silk_out[..sub_output_len]);
+
+                    // A SILK-only frame's redundancy is implicit (libopus
+                    // opus_decode_frame 452-479): no flag is coded — when bits
+                    // are left for it, redundancy is on, `celt_to_silk` reads
+                    // as one bit, and the frame's tail past the SILK layer is
+                    // a 5 ms redundant CELT frame. Going to CELT it decodes
+                    // from a reset CELT state — which the next CELT frame
+                    // carries on — and its second half fades into the frame's
+                    // last 2.5 ms (595-603). Coming from CELT it decodes from
+                    // the old state, opens the frame and fades into its first
+                    // 5 ms (608-617). Only the SILK-to-CELT direction counts
+                    // as `prev_redundancy` (657), which spares the next frame
+                    // its transition bridge and CELT reset (346-352, 551-553).
+                    let len = payload.len();
+                    let mut redundancy_bytes = 0usize;
+                    let mut celt_to_silk = false;
+                    let mut redundant = [0.0f32; REDUNDANT_MAX];
+                    let has_tail = !payload.is_empty() && rc.tell() + 17 <= (8 * len) as i32;
+                    if has_tail {
+                        celt_to_silk = rc.decode_bit_logp(1);
+                        // The tail is everything the SILK layer left:
+                        // `redundancy_bytes = len - ceil(ec_tell/8)`.
+                        redundancy_bytes = len - ((rc.tell() as usize + 7) >> 3);
+                        // Keep the main range coder in sync, as libopus's
+                        // `dec.storage -= redundancy_bytes`.
+                        rc.storage -= redundancy_bytes as u32;
+                        if celt_to_silk {
+                            // From the old CELT state, before any reset — a
+                            // CELT-to-SILK switch's bridge (532-541).
+                            self.decode_redundant(
+                                &payload[len - redundancy_bytes..],
+                                redundant_end_band,
+                                f5,
+                                &mut redundant,
+                            );
+                        }
+                    }
+                    if fi == 0 {
+                        if has_tail {
+                            // libopus: `if (redundancy) transition = 0`.
+                            transition = false;
+                        } else if from_celt {
+                            // Without a tail there is nothing to fade into:
+                            // bridge out of CELT with 5 ms of the old CELT
+                            // state concealed forward (libopus's
+                            // `pcm_transition`), not the previous frame's last
+                            // 5 ms, which already played.
+                            self.conceal_celt_bridge()?;
+                        }
+                    }
+                    let ch = self.channels;
+                    if has_tail && !celt_to_silk && f5 > 0 && sub_output_len >= f5 * ch {
+                        // SILK to CELT: reset CELT, decode the redundant frame
+                        // with all bands from that fresh state — the next CELT
+                        // frame carries it on — and fade its second half into
+                        // the frame's last 2.5 ms (595-603).
+                        self.celt_dec.reset_state();
+                        self.decode_redundant(
+                            &payload[len - redundancy_bytes..],
+                            redundant_end_band,
+                            f5,
+                            &mut redundant,
+                        );
+                        let at = out_start + (sub_frame_size - f2_5) * ch;
+                        let mut tail = [0.0f32; REDUNDANT_MAX];
+                        tail[..f2_5 * ch].copy_from_slice(&output[at..at + f2_5 * ch]);
+                        smooth_fade(
+                            &tail[..f2_5 * ch],
+                            &redundant[f2_5 * ch..f5 * ch],
+                            &mut output[at..at + f2_5 * ch],
+                            f2_5,
+                            ch,
+                            window,
+                            inc,
+                        );
+                    } else if has_tail
+                        && celt_to_silk
+                        && (self.prev_mode != Some(OpusMode::SilkOnly) || self.prev_redundancy)
+                        && f5 > 0
+                        && sub_output_len >= f5 * ch
+                    {
+                        // CELT to SILK: the redundant frame opens this one and
+                        // fades into its first 5 ms (608-617). It is ignored
+                        // when the CELT state it came from is stale (606-608).
+                        output[out_start..out_start + f2_5 * ch]
+                            .copy_from_slice(&redundant[..f2_5 * ch]);
+                        let at = out_start + f2_5 * ch;
+                        let mut next = [0.0f32; REDUNDANT_MAX];
+                        next[..f2_5 * ch].copy_from_slice(&output[at..at + f2_5 * ch]);
+                        smooth_fade(
+                            &redundant[f2_5 * ch..f5 * ch],
+                            &next[..f2_5 * ch],
+                            &mut output[at..at + f2_5 * ch],
+                            f2_5,
+                            ch,
+                            window,
+                            inc,
+                        );
+                    }
+                    has_redundancy = has_tail && !celt_to_silk;
                 }
                 decoded_total
             }
