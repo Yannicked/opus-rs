@@ -9,6 +9,7 @@ use crate::quant_bands::{
 };
 use crate::range_coder::RangeCoder;
 use crate::rate::{BITRES, clt_compute_allocation};
+use core::mem::MaybeUninit;
 
 #[cfg(not(feature = "std"))]
 use crate::compat::Math;
@@ -3213,6 +3214,19 @@ impl CeltDecoder {
     /// (8000–48000); the decoder always operates at 48 kHz internally and
     /// decimates by `resampling_factor(sampling_rate)` on output.
     pub fn new(mode: &'static CeltMode, channels: usize, sampling_rate: i32) -> Self {
+        let mut decoder = MaybeUninit::uninit();
+        unsafe {
+            Self::write_new(decoder.as_mut_ptr(), mode, channels, sampling_rate);
+            decoder.assume_init()
+        }
+    }
+
+    pub(crate) unsafe fn write_new(
+        this: *mut Self,
+        mode: &'static CeltMode,
+        channels: usize,
+        sampling_rate: i32,
+    ) {
         // All internal buffers are sized for at most 2 channels
         // (issue #27 deep scan).
         assert!(
@@ -3226,39 +3240,53 @@ impl CeltDecoder {
         // may be handed one. Capacity is fixed, so this costs no memory.
         let nb_x_ch = nb_ebands * CELT_MAX_CHANNELS;
         let dec_frame_x_ch = DECODE_BUFFER_SIZE * CELT_MAX_CHANNELS;
-        Self {
-            mode,
-            channels,
-            stream_channels: channels,
-            downsample: resampling_factor(sampling_rate),
-            decode_mem: FixedVec::from_value(0.0, channels * (DECODE_BUFFER_SIZE + overlap)),
-            old_band_e: FixedVec::from_value(0.0, nb_x_ch),
-            preemph_mem: FixedVec::from_value(0.0, channels),
-            prefilter_mem: FixedVec::from_value(0.0, channels * COMBFILTER_MAXPERIOD),
-            prefilter_period: COMBFILTER_MINPERIOD,
-            prefilter_period_old: COMBFILTER_MINPERIOD,
-            prefilter_gain: 0.0,
-            prefilter_gain_old: 0.0,
-            prefilter_tapset: 0,
-            prefilter_tapset_old: 0,
+        unsafe {
+            (&raw mut (*this).mode).write(mode);
+            (&raw mut (*this).channels).write(channels);
+            (&raw mut (*this).stream_channels).write(channels);
+            (&raw mut (*this).downsample).write(resampling_factor(sampling_rate));
+            FixedVec::write_from_value(
+                &raw mut (*this).decode_mem,
+                0.0,
+                channels * (DECODE_BUFFER_SIZE + overlap),
+            );
+            FixedVec::write_from_value(&raw mut (*this).old_band_e, 0.0, nb_x_ch);
+            FixedVec::write_from_value(&raw mut (*this).preemph_mem, 0.0, channels);
+            FixedVec::write_from_value(
+                &raw mut (*this).prefilter_mem,
+                0.0,
+                channels * COMBFILTER_MAXPERIOD,
+            );
+            (&raw mut (*this).prefilter_period).write(COMBFILTER_MINPERIOD);
+            (&raw mut (*this).prefilter_period_old).write(COMBFILTER_MINPERIOD);
+            (&raw mut (*this).prefilter_gain).write(0.0);
+            (&raw mut (*this).prefilter_gain_old).write(0.0);
+            (&raw mut (*this).prefilter_tapset).write(0);
+            (&raw mut (*this).prefilter_tapset_old).write(0);
             // oldLogE and oldLogE2 start at -28 dB, as libopus's reset (run at init) sets them.
-            old_band_e2: FixedVec::from_value(-28.0, nb_x_ch),
-            old_band_e3: FixedVec::from_value(-28.0, nb_x_ch),
-            rng: 0,
-
-            w_tf_res: FixedVec::from_value(0, nb_ebands),
-            w_cap: FixedVec::from_value(0, nb_ebands),
-            w_offsets: FixedVec::from_value(0, nb_ebands),
-            w_pulses: FixedVec::from_value(0, nb_ebands),
-            w_ebits: FixedVec::from_value(0, nb_x_ch),
-            w_fine_priority: FixedVec::from_value(0, nb_x_ch),
-
-            w_x: FixedVec::from_value(0.0, dec_frame_x_ch + STRIDE_ACCESS_PAD),
-            w_collapse_masks: FixedVec::from_value(0, nb_x_ch),
-            w_freq: FixedVec::from_value(0.0, dec_frame_x_ch + 4), // +4: NEON backward pre-rotation reads up to 3 elements past n2
-            w_band_amp: FixedVec::from_value(0.0, nb_x_ch),
-            w_pcm_frame: FixedVec::from_value(0.0, DECODE_BUFFER_SIZE),
-            w_post: FixedVec::from_value(0.0, DECODE_BUFFER_SIZE + COMBFILTER_MAXPERIOD),
+            FixedVec::write_from_value(&raw mut (*this).old_band_e2, -28.0, nb_x_ch);
+            FixedVec::write_from_value(&raw mut (*this).old_band_e3, -28.0, nb_x_ch);
+            (&raw mut (*this).rng).write(0);
+            FixedVec::write_from_value(&raw mut (*this).w_tf_res, 0, nb_ebands);
+            FixedVec::write_from_value(&raw mut (*this).w_cap, 0, nb_ebands);
+            FixedVec::write_from_value(&raw mut (*this).w_offsets, 0, nb_ebands);
+            FixedVec::write_from_value(&raw mut (*this).w_pulses, 0, nb_ebands);
+            FixedVec::write_from_value(&raw mut (*this).w_ebits, 0, nb_x_ch);
+            FixedVec::write_from_value(&raw mut (*this).w_fine_priority, 0, nb_x_ch);
+            FixedVec::write_from_value(
+                &raw mut (*this).w_x,
+                0.0,
+                dec_frame_x_ch + STRIDE_ACCESS_PAD,
+            );
+            FixedVec::write_from_value(&raw mut (*this).w_collapse_masks, 0, nb_x_ch);
+            FixedVec::write_from_value(&raw mut (*this).w_freq, 0.0, dec_frame_x_ch + 4); // +4: NEON backward pre-rotation reads up to 3 elements past n2
+            FixedVec::write_from_value(&raw mut (*this).w_band_amp, 0.0, nb_x_ch);
+            FixedVec::write_from_value(&raw mut (*this).w_pcm_frame, 0.0, DECODE_BUFFER_SIZE);
+            FixedVec::write_from_value(
+                &raw mut (*this).w_post,
+                0.0,
+                DECODE_BUFFER_SIZE + COMBFILTER_MAXPERIOD,
+            );
         }
     }
 

@@ -28,6 +28,7 @@ pub mod silk;
 pub use silk::{SilkResampler, SilkResamplerDown1_3, SilkResamplerDown1_6};
 
 use crate::fixedvec::FixedVec;
+use core::mem::MaybeUninit;
 pub use celt::{CeltDecoder, CeltEncoder};
 use hp_cutoff::{dc_reject_float, hp_cutoff, hp_cutoff_float, hp_cutoff_i16};
 use range_coder::RangeCoder;
@@ -1729,6 +1730,21 @@ pub struct OpusDecoder {
 
 impl OpusDecoder {
     pub fn new(sampling_rate: i32, channels: usize) -> Result<Self, &'static str> {
+        let mut decoder = MaybeUninit::uninit();
+        Self::init(&mut decoder, sampling_rate, channels)?;
+        Ok(unsafe { decoder.assume_init() })
+    }
+
+    /// Builds a decoder in `slot` instead of returning it.
+    ///
+    /// Without the `heap` feature the decoder is about 175 KB, and `new` returns it
+    /// through the stack. `init` writes it straight into memory you provide, such as
+    /// a `static`, so it never has to fit on the stack.
+    pub fn init(
+        slot: &mut MaybeUninit<Self>,
+        sampling_rate: i32,
+        channels: usize,
+    ) -> Result<&mut Self, &'static str> {
         if ![8000, 12000, 16000, 24000, 48000].contains(&sampling_rate) {
             return Err("Invalid sampling rate");
         }
@@ -1737,60 +1753,53 @@ impl OpusDecoder {
         }
 
         let mode = modes::default_mode();
-        #[cfg(feature = "heap")]
-        let celt_dec = Box::new(CeltDecoder::new(mode, channels, sampling_rate));
-        #[cfg(not(feature = "heap"))]
-        let celt_dec = CeltDecoder::new(mode, channels, sampling_rate);
+        let this = slot.as_mut_ptr();
+        unsafe {
+            #[cfg(feature = "heap")]
+            {
+                (&raw mut (*this).celt_dec).write(Box::new(CeltDecoder::new(mode, channels, sampling_rate)));
+                (&raw mut (*this).silk_dec).write(Box::new(silk::dec_api::SilkDecoder::new()));
+            }
+            #[cfg(not(feature = "heap"))]
+            {
+                CeltDecoder::write_new(&raw mut (*this).celt_dec, mode, channels, sampling_rate);
+                silk::dec_api::SilkDecoder::write_new(&raw mut (*this).silk_dec);
+            }
+            (&raw mut (*this).sampling_rate).write(sampling_rate);
+            (&raw mut (*this).channels).write(channels);
+            (&raw mut (*this).prev_mode).write(None);
+            (&raw mut (*this).prev_redundancy).write(false);
+            (&raw mut (*this).frame_size).write(0);
+            (&raw mut (*this).bandwidth).write(Bandwidth::Auto);
+            (&raw mut (*this).stream_channels).write(channels);
+            (&raw mut (*this).silk_resampler).write(silk::resampler::SilkResampler::default());
+            (&raw mut (*this).silk_resampler_2).write(silk::resampler::SilkResampler::default());
+            (&raw mut (*this).prev_internal_rate).write(0);
+            (&raw mut (*this).hybrid_skip_celt).write(false);
+            #[cfg(feature = "heap")]
+            {
+                (&raw mut (*this).w_pcm_i16).write(Box::new(FixedVec::from_value(0i16, 960 * channels)));
+                (&raw mut (*this).w_silk_out).write(Box::new(FixedVec::from_value(0.0f32, OPUS_MAX_SUBFRAME * channels)));
+                (&raw mut (*this).w_pcm_resampled).write(Box::new(FixedVec::from_value(0i16, OPUS_MAX_SUBFRAME * channels)));
+                (&raw mut (*this).w_celt_planar).write(Box::new(FixedVec::from_value(0.0f32, OPUS_MAX_SUBFRAME * channels)));
+                (&raw mut (*this).w_celt_out).write(Box::new(FixedVec::from_value(0.0f32, OPUS_MAX_SUBFRAME * channels)));
+                (&raw mut (*this).prev_pcm_tail).write(Box::new(FixedVec::from_value(0.0f32, 240 * channels)));
+            }
+            #[cfg(not(feature = "heap"))]
+            {
+                FixedVec::write_from_value(&raw mut (*this).w_pcm_i16, 0i16, 960 * channels);
+                FixedVec::write_from_value(&raw mut (*this).w_silk_out, 0.0f32, OPUS_MAX_SUBFRAME * channels);
+                FixedVec::write_from_value(&raw mut (*this).w_pcm_resampled, 0i16, OPUS_MAX_SUBFRAME * channels);
+                FixedVec::write_from_value(&raw mut (*this).w_celt_planar, 0.0f32, OPUS_MAX_SUBFRAME * channels);
+                FixedVec::write_from_value(&raw mut (*this).w_celt_out, 0.0f32, OPUS_MAX_SUBFRAME * channels);
+                FixedVec::write_from_value(&raw mut (*this).prev_pcm_tail, 0.0f32, 240 * channels);
+            }
+        }
 
-        #[cfg(feature = "heap")]
-        let mut silk_dec = Box::new(silk::dec_api::SilkDecoder::new());
-        #[cfg(not(feature = "heap"))]
-        let mut silk_dec = silk::dec_api::SilkDecoder::new();
-        silk_dec.init(sampling_rate.min(16000), channels as i32);
-        silk_dec.channel_state[0].fs_api_hz = sampling_rate;
-
-        Ok(Self {
-            celt_dec,
-            silk_dec,
-            sampling_rate,
-            channels,
-            prev_mode: None,
-            prev_redundancy: false,
-            frame_size: 0,
-            bandwidth: Bandwidth::Auto,
-            stream_channels: channels,
-            silk_resampler: silk::resampler::SilkResampler::default(),
-            silk_resampler_2: silk::resampler::SilkResampler::default(),
-            prev_internal_rate: 0,
-            hybrid_skip_celt: false,
-
-            #[cfg(not(feature = "heap"))]
-            w_pcm_i16: FixedVec::from_value(0i16, 960 * channels),
-            #[cfg(feature = "heap")]
-            w_pcm_i16: Box::new(FixedVec::from_value(0i16, 960 * channels)),
-
-            #[cfg(not(feature = "heap"))]
-            w_silk_out: FixedVec::from_value(0.0f32, OPUS_MAX_SUBFRAME * channels),
-            #[cfg(feature = "heap")]
-            w_silk_out: Box::new(FixedVec::from_value(0.0f32, OPUS_MAX_SUBFRAME * channels)),
-            #[cfg(not(feature = "heap"))]
-            w_pcm_resampled: FixedVec::from_value(0i16, OPUS_MAX_SUBFRAME * channels),
-            #[cfg(feature = "heap")]
-            w_pcm_resampled: Box::new(FixedVec::from_value(0i16, OPUS_MAX_SUBFRAME * channels)),
-            #[cfg(not(feature = "heap"))]
-            w_celt_planar: FixedVec::from_value(0.0f32, OPUS_MAX_SUBFRAME * channels),
-            #[cfg(feature = "heap")]
-            w_celt_planar: Box::new(FixedVec::from_value(0.0f32, OPUS_MAX_SUBFRAME * channels)),
-            #[cfg(not(feature = "heap"))]
-            w_celt_out: FixedVec::from_value(0.0f32, OPUS_MAX_SUBFRAME * channels),
-            #[cfg(feature = "heap")]
-            w_celt_out: Box::new(FixedVec::from_value(0.0f32, OPUS_MAX_SUBFRAME * channels)),
-
-            #[cfg(not(feature = "heap"))]
-            prev_pcm_tail: FixedVec::from_value(0.0f32, 240 * channels),
-            #[cfg(feature = "heap")]
-            prev_pcm_tail: Box::new(FixedVec::from_value(0.0f32, 240 * channels)),
-        })
+        let decoder = unsafe { slot.assume_init_mut() };
+        decoder.silk_dec.init(sampling_rate.min(16000), channels as i32);
+        decoder.silk_dec.channel_state[0].fs_api_hz = sampling_rate;
+        Ok(decoder)
     }
 
     /// Decode one Opus packet into interleaved `f32` PCM, returning the

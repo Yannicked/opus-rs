@@ -81,7 +81,16 @@ The public API (`OpusEncoder`/`OpusDecoder` with `encode`/`decode` writing into 
 - **Large structs:** without `heap`, every working buffer is inline, so
   `OpusEncoder`/`OpusDecoder` are large (~250 KB / ~175 KB each). Place them in a
   `static` (wrap init in your own `Once`-like guard) or a dedicated buffer rather
-  than on the stack. Test threads use a 16 MB stack (see `.cargo/config.toml`).
+  than on the stack. `OpusDecoder::new` still returns the decoder through the stack,
+  so use `OpusDecoder::init` to build it directly in that memory:
+
+  ```rust
+  static mut DECODER: MaybeUninit<OpusDecoder> = MaybeUninit::uninit();
+
+  let decoder = OpusDecoder::init(unsafe { &mut *(&raw mut DECODER) }, 48000, 2)?;
+  ```
+
+  Test threads use a 16 MB stack (see `.cargo/config.toml`).
 - **x86 SIMD:** without `std`, AVX/AVX2 dispatch falls back to compile-time detection. Build with `RUSTFLAGS="-C target-feature=+avx2"` to enable it. aarch64 NEON is unconditional.
 - **Packets are capped** at the RFC 6716 maximum of 1276 bytes (the heap-free range-coder buffer is sized accordingly); standalone `RangeCoder`/CELT use supports up to 2048 bytes.
 - **Verified targets:** `thumbv7em-none-eabi` (Cortex-M), `wasm32-unknown-unknown`, and any Linux no_std target. With `portable-atomic`, also `thumbv6m-none-eabi` and `riscv32imc-unknown-none-elf`. Check with `scripts/check_no_std.sh`.

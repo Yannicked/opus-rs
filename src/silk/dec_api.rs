@@ -9,6 +9,7 @@ use crate::silk::define::*;
 use crate::silk::init_decoder::{silk_decoder_set_fs, silk_init_decoder};
 use crate::silk::stereo_ms_to_lr::{StereoDecState, silk_stereo_ms_to_lr};
 use crate::silk::tables::{SILK_LBRR_FLAGS_2_ICDF, SILK_LBRR_FLAGS_3_ICDF};
+use core::mem::MaybeUninit;
 
 pub struct SilkDecoder {
     pub channel_state: [SilkDecoderState; 2],
@@ -34,17 +35,26 @@ impl Default for SilkDecoder {
 
 impl SilkDecoder {
     pub fn new() -> Self {
-        let mut dec = Self {
-            channel_state: [SilkDecoderState::default(), SilkDecoderState::default()],
-            n_channels_api: 1,
-            n_channels_internal: 1,
-            prev_decode_only_middle: 0,
-            s_stereo: StereoDecState::default(),
-            w_silk_buf: [[0; MAX_FRAME_LENGTH + 2]; 2],
-        };
-        silk_init_decoder(&mut dec.channel_state[0]);
-        silk_init_decoder(&mut dec.channel_state[1]);
-        dec
+        let mut decoder = MaybeUninit::uninit();
+        unsafe {
+            Self::write_new(decoder.as_mut_ptr());
+            decoder.assume_init()
+        }
+    }
+
+    pub(crate) unsafe fn write_new(this: *mut Self) {
+        unsafe {
+            let states = (&raw mut (*this).channel_state).cast::<SilkDecoderState>();
+            for i in 0..2 {
+                states.add(i).write(SilkDecoderState::default());
+                silk_init_decoder(&mut *states.add(i));
+            }
+            (&raw mut (*this).n_channels_api).write(1);
+            (&raw mut (*this).n_channels_internal).write(1);
+            (&raw mut (*this).prev_decode_only_middle).write(0);
+            (&raw mut (*this).s_stereo).write(StereoDecState::default());
+            (&raw mut (*this).w_silk_buf).write_bytes(0, 1);
+        }
     }
 
     pub fn init(&mut self, sample_rate_hz: i32, channels: i32) -> i32 {

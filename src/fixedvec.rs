@@ -44,6 +44,20 @@ impl<T, const N: usize> FixedVec<T, N> {
         s
     }
 
+    pub(crate) unsafe fn write_from_value(this: *mut Self, value: T, len: usize)
+    where
+        T: Clone,
+    {
+        assert!(len <= N, "FixedVec capacity exceeded");
+        unsafe {
+            let buf = (&raw mut (*this).buf).cast::<MaybeUninit<T>>();
+            for i in 0..len {
+                (*buf.add(i)).write(value.clone());
+            }
+            (&raw mut (*this).len).write(len);
+        }
+    }
+
     /// Copy a slice into a fresh buffer.
     pub fn from_slice(src: &[T]) -> Self
     where
