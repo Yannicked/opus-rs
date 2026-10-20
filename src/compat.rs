@@ -13,7 +13,11 @@
 use core::cell::UnsafeCell;
 use core::hint;
 use core::mem::MaybeUninit;
-use core::sync::atomic::{AtomicU8, Ordering};
+#[cfg(not(feature = "portable-atomic"))]
+use core::sync::atomic::AtomicU8;
+use core::sync::atomic::Ordering;
+#[cfg(feature = "portable-atomic")]
+use portable_atomic::AtomicU8;
 
 // ---------------------------------------------------------------------------
 // OnceCell (heap-free lazy initialization)

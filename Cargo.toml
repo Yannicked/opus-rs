@@ -32,9 +32,11 @@ heap = ["std"]
 # needed when `std` is enabled. Enable with:
 #   opus-rs = { version = "...", default-features = false, features = ["libm"] }
 libm = ["dep:libm"]
+portable-atomic = ["dep:portable-atomic"]
 
 [dependencies]
 libm = { version = "0.2", optional = true, default-features = false }
+portable-atomic = { version = "1", optional = true, default-features = false }
 
 [dev-dependencies]
 criterion = { version = "0.8.2", features = ["html_reports"] }
