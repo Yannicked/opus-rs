@@ -128,6 +128,22 @@ Measured on Apple Silicon M-series (aarch64), compiled with `--release` (opt-lev
 
 ### Unreleased
 
+### 0.1.39
+
+- **Fix: a SILK-only frame's trailing redundancy now decodes, like libopus
+  (issue #66).** A SILK-only frame signals no redundancy flag — when bits are
+  left for it, redundancy is on, `celt_to_silk` reads as one bit, and the
+  frame's whole tail is a 5 ms redundant CELT frame (`opus_decoder.c`
+  452-479). Going to CELT it decodes from a reset CELT state, which the next
+  CELT frame carries on, and fades into the frame's last 2.5 ms (595-603);
+  coming from CELT it opens the frame and fades into its first 5 ms
+  (608-617). Only the SILK-to-CELT direction sets `prev_redundancy` (657),
+  which now spares the next frame its transition bridge and CELT reset. The
+  packet-start CELT reset narrows to switches into CELT, matching libopus's
+  reset inside `mode != MODE_SILK_ONLY` (551-553). SILK-only↔CELT switches
+  (NB/MB low-bitrate streams) decoded 4-5 dB from libopus at the switch;
+  now 132 dB both ways.
+
 ### 0.1.38
 
 - **Fix: a Hybrid frame's mode-switch redundancy now decodes as libopus's
