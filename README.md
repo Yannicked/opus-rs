@@ -128,6 +128,41 @@ Measured on Apple Silicon M-series (aarch64), compiled with `--release` (opt-lev
 
 ### Unreleased
 
+### 0.1.38
+
+- **Fix: a Hybrid frame's mode-switch redundancy now decodes as libopus's
+  does.** The 5 ms redundant CELT frame (RFC 6716 §4.5.1) used to be read
+  but never decoded, and the frame's own CELT layer was skipped: every
+  Hybrid↔CELT switch glitched for 40–60 ms. The main layer now decodes from
+  the bytes before the redundant frame, the redundant frame decodes with all
+  bands (from the old CELT state going to SILK, from a reset state going to
+  CELT) and crossfades in with the CELT window; only a SILK-to-CELT frame's
+  redundancy sets `prev_redundancy` (PR #58). Worst switch window vs
+  libopus: 2 dB → 129 dB.
+- **Fix: CELT's energy history starts at −28 dB, as libopus's reset sets
+  it, and the bands a frame doesn't code forget their energies (PR #59).**
+  Starting at 0 made anti-collapse inject extra noise into the first two
+  transient frames: CELT's first packets decoded 25–45 dB from libopus.
+  Now 119 dB at the onset.
+- **Fix: a super-wideband Hybrid frame's CELT layer ends at band 19, from
+  the packet's bandwidth as in libopus (PR #60).** It read two bands its
+  encoder never coded and sat 10–15 dB from libopus throughout. Now 143 dB.
+- **Fix: switches out of CELT reset SILK and bridge with 5 ms of the old
+  CELT state concealed forward, as libopus does (PR #61).** opus-rs kept the
+  SILK state (and resampler) from before the CELT run and bridged with the
+  previous frame's last 5 ms, which had already played: a ~25 ms click at
+  every CELT→SILK/Hybrid switch. Now 132 dB at the switch.
+- **New: `OpusDecoder::init(slot, sampling_rate, channels)` builds the
+  decoder in place (PR #65, issue #62 item 1).** Without `heap`,
+  `OpusDecoder::new` returns ~175 KB by value through the stack, which no
+  MCU has; `init` writes it straight into a `static`. `new` goes through
+  `init`, so the two cannot drift. `init`'s stack frame is 44 bytes.
+- **New: build on targets without compare-and-swap atomics via the
+  optional `portable-atomic` feature (PR #64, issue #62 item 2).** Enables
+  `thumbv6m-none-eabi` (Cortex-M0/M0+) and `riscv32imc-unknown-none-elf`
+  (ESP32-C3); there you also pick how portable-atomic emulates CAS (its
+  `critical-section` feature, or `--cfg portable_atomic_unsafe_assume_single_core`
+  on single-core chips). Nothing changes when the feature is off.
 - **Fix: SILK CBR with in-band FEC busted packets into concealed frames
   (issue #51).** SILK's frame target now leaves room for the packet's LBRR
   section, as libopus's does. This ports `enc_API.c`'s per-frame target, for
