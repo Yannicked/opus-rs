@@ -3174,6 +3174,9 @@ impl CeltEncoder {
 pub struct CeltDecoder {
     mode: &'static CeltMode,
     channels: usize,
+    /// Channels coded in the stream (libopus `CELT_SET_CHANNELS`). It drives
+    /// the bitstream; `channels` drives synthesis and the output.
+    stream_channels: usize,
     /// Decimation factor for non-48kHz API rates (1=48k, 2=24k, 3=16k, 4=12k, 6=8k).
     /// Mirrors libopus `CELTDecoder.downsample`.
     downsample: usize,
@@ -3218,11 +3221,15 @@ impl CeltDecoder {
         );
         let overlap = mode.overlap;
         let nb_ebands = mode.nb_ebands;
-        let nb_x_ch = nb_ebands * channels;
-        let dec_frame_x_ch = DECODE_BUFFER_SIZE * channels;
+        // Band and spectrum buffers are sized for a stereo stream whatever
+        // the output (libopus keeps `2*nbEBands` energies): a mono decoder
+        // may be handed one. Capacity is fixed, so this costs no memory.
+        let nb_x_ch = nb_ebands * CELT_MAX_CHANNELS;
+        let dec_frame_x_ch = DECODE_BUFFER_SIZE * CELT_MAX_CHANNELS;
         Self {
             mode,
             channels,
+            stream_channels: channels,
             downsample: resampling_factor(sampling_rate),
             decode_mem: FixedVec::from_value(0.0, channels * (DECODE_BUFFER_SIZE + overlap)),
             old_band_e: FixedVec::from_value(0.0, nb_x_ch),
@@ -3257,6 +3264,17 @@ impl CeltDecoder {
 
     pub fn decode(&mut self, compressed: &[u8], frame_size: usize, pcm: &mut [f32]) -> usize {
         self.decode_impl(compressed, frame_size, pcm, 0, self.mode.nb_ebands)
+    }
+
+    /// Set the number of channels coded in the stream (libopus
+    /// `CELT_SET_CHANNELS`). A mono stream plays on both channels of a stereo
+    /// decoder; a stereo stream is downmixed by a mono one.
+    pub fn set_stream_channels(&mut self, channels: usize) {
+        assert!(
+            (1..=CELT_MAX_CHANNELS).contains(&channels),
+            "CeltDecoder::set_stream_channels: channels must be 1 or 2 (got {channels})"
+        );
+        self.stream_channels = channels;
     }
 
     /// Reset all decoder state (equivalent to libopus `OPUS_RESET_STATE`).
@@ -3341,7 +3359,10 @@ impl CeltDecoder {
         end_band: usize,
     ) -> usize {
         let mode = self.mode;
-        let channels = self.channels;
+        // `channels` are coded in the stream and drive the bitstream (libopus
+        // `C`); `out_channels` are synthesised (`CC`).
+        let channels = self.stream_channels;
+        let out_channels = self.channels;
         let nb_ebands = mode.nb_ebands;
         let end_band = end_band.min(nb_ebands).max(start_band);
         let overlap = mode.overlap;
@@ -3370,7 +3391,7 @@ impl CeltDecoder {
         // Reject an undersized output buffer before spending the whole decode
         // (it used to panic only at the final sample copy, issue #27 deep
         // scan).
-        if pcm.len() < api_frame_size * channels {
+        if pcm.len() < api_frame_size * out_channels {
             return 0;
         }
 
@@ -3383,6 +3404,15 @@ impl CeltDecoder {
         }
         if (mode.short_mdct_size << lm) != frame_size {
             lm = 0;
+        }
+
+        // A mono stream predicts from the louder channel of a stereo frame
+        // before it (celt_decoder.c).
+        if channels == 1 {
+            let (first, second) = self.old_band_e.split_at_mut(nb_ebands);
+            for (e, &e2) in first.iter_mut().zip(&second[..nb_ebands]) {
+                *e = e.max(e2);
+            }
         }
 
         let mut tell = rc.tell();
@@ -3652,8 +3682,9 @@ impl CeltDecoder {
         // bound=0/start=end=0). Filling `w_freq` with zeros and skipping
         // denormalisation achieves the same effect without passing a
         // dedicated `silence` flag through `denormalise_bands`.
-        self.w_freq[..frame_size * channels].fill(0.0);
-        let freq = &mut self.w_freq[..frame_size * channels];
+        let freq_len = frame_size * channels.max(out_channels);
+        self.w_freq[..freq_len].fill(0.0);
+        let freq = &mut self.w_freq[..freq_len];
         if !silence {
             // Recompute band_amp after unquant_energy_finalise, which adjusts old_band_e.
             // (Mirrors the encoder's resynth path: log2amp is called after quant_energy_finalise.)
@@ -3682,6 +3713,17 @@ impl CeltDecoder {
         }
         // Always trace freq and band_amp for comparison
 
+        // Copy a mono stream to both outputs, or downmix a stereo stream to
+        // one (libopus celt_synthesis).
+        if channels == 1 && out_channels == 2 {
+            freq.copy_within(..frame_size, frame_size);
+        } else if channels == 2 && out_channels == 1 {
+            let (left, right) = freq.split_at_mut(frame_size);
+            for (l, &r) in left.iter_mut().zip(&right[..frame_size]) {
+                *l = 0.5 * *l + 0.5 * r;
+            }
+        }
+
         let (shift, b) = if short_blocks {
             (mode.max_lm, 1 << lm)
         } else {
@@ -3689,7 +3731,7 @@ impl CeltDecoder {
         };
         let n = frame_size / b;
 
-        for c in 0..channels {
+        for c in 0..out_channels {
             let channel_mem_offset = c * (DECODE_BUFFER_SIZE + overlap);
 
             let mem_size = DECODE_BUFFER_SIZE + overlap;
@@ -3856,18 +3898,22 @@ impl CeltDecoder {
             self.prefilter_tapset_old = self.prefilter_tapset;
         }
 
+        if channels == 1 {
+            self.old_band_e.copy_within(..nb_ebands, nb_ebands);
+        }
+        // Both halves, as libopus updates `oldLogE` over `2*nbEBands`.
         if !is_transient {
             self.old_band_e3.copy_from_slice(&self.old_band_e2);
             self.old_band_e2.copy_from_slice(&self.old_band_e);
         } else {
-            let nb_ebands = mode.nb_ebands;
-            for i in 0..channels * nb_ebands {
-                self.old_band_e2[i] = self.old_band_e2[i].min(self.old_band_e[i]);
+            for (e2, &e) in self.old_band_e2.iter_mut().zip(self.old_band_e.iter()) {
+                *e2 = e2.min(e);
             }
         }
         // In case start or end change (libopus celt_decoder.c), the bands this frame didn't code
-        // forget their energy and history.
-        for c in 0..channels {
+        // forget their energy and history. Both halves, as libopus clears them: a mono stream
+        // keeps the second, and its next frame predicts from the larger of the two.
+        for c in 0..CELT_MAX_CHANNELS {
             for i in (0..start_band).chain(end_band..nb_ebands) {
                 self.old_band_e[c * nb_ebands + i] = 0.0;
                 self.old_band_e2[c * nb_ebands + i] = -28.0;

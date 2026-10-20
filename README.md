@@ -183,6 +183,22 @@ Measured on Apple Silicon M-series (aarch64), compiled with `--release` (opt-lev
   codebook now come from one branch, as in libopus's `decoder_set_fs.c`: mono
   mediumband decodes bit-exactly against libopus, and stereo matches it as
   far as the stereo predictor allows (issue #42).
+- **Fix: a stereo decoder rejected mono packets, and a mono decoder rejected
+  stereo ones (issue #62, item 3).** `OpusDecoder::decode` returned "Channel
+  count mismatch between packet and decoder" whenever a packet's ToC
+  disagreed with the decoder, and libopus stereo encoders send mono packets
+  at low bitrates. Both now decode as in libopus. A stereo decoder plays a
+  mono packet on both channels. A mono decoder plays a stereo packet's mid
+  (SILK) or the average of its channels' spectra (CELT). Channel switches
+  mid-stream follow `silk/dec_API.c`, which starts the side channel and the
+  right resampler afresh when a stream turns stereo. SILK decodes bit-exactly
+  against libopus in every case, switches included. CELT and Hybrid agree
+  with libopus as closely as when the channel counts match (47-62 dB).
+  Streams whose channel count matches the decoder's decode exactly as
+  before. CELT's clearing of the bands a frame doesn't code (#59) now covers
+  both halves of the energy state, as libopus's does. A mono stream keeps
+  the second half, and stale energies there made a wider frame decode its
+  new bands as noise (-0.9 dB against libopus).
 
 ### 0.1.37
 
