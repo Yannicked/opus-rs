@@ -1088,11 +1088,11 @@ pub fn pvq_search_fast_select(x: &[f32], y: &mut [i32], k: i32, n: usize) -> f32
         while k > 0 {
             let batch = BATCH_SIZE.min(k);
 
-            for i in 0..n {
-                let rxy = xy + abs_x[i];
-                let ryy = yy + y2f[i] + 1.0;
+            for (i, ((sc, &ax), &y2)) in scores.iter_mut().zip(abs_x).zip(y2f.iter()).enumerate() {
+                let rxy = xy + ax;
+                let ryy = yy + y2 + 1.0;
                 let score = rxy * rxy / ryy;
-                scores[i] = (score, i);
+                *sc = (score, i);
             }
 
             let pos = batch as usize;
