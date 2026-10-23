@@ -202,22 +202,22 @@ pub fn haar1(x: &mut [f32], n0: usize, stride: usize) {
     #[cfg(target_arch = "aarch64")]
     {
         if stride == 1 && n0 >= 64 {
-            haar1_neon(x, n0);
+            // SAFETY: NEON is part of the aarch64 baseline.
+            unsafe { haar1_neon(x, n0) };
         } else {
             haar1_scalar(x, n0, stride);
         }
     }
+    // NOTE: the previous AVX1 kernel loaded its second vector at +4
+    // (overlapping the first) and deinterleaved into quartet-swapped
+    // order, corrupting every other 8-sample block. The corrected kernel
+    // needs a 64-bit lane permute, which is AVX2-only; pre-AVX2 CPUs use
+    // the scalar path.
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    unsafe {
-        // NOTE: the previous AVX1 kernel loaded its second vector at +4
-        // (overlapping the first) and deinterleaved into quartet-swapped
-        // order, corrupting every other 8-sample block. The corrected kernel
-        // needs a 64-bit lane permute, which is AVX2-only; pre-AVX2 CPUs use
-        // the scalar path.
-        if stride == 1 && n0 >= 16 && crate::compat::x86_has_avx2() {
-            haar1_avx2(x, n0);
-            return;
-        }
+    if stride == 1 && n0 >= 16 && crate::compat::x86_has_avx2() {
+        // SAFETY: the CPU supports AVX2, checked just above.
+        unsafe { haar1_avx2(x, n0) };
+        return;
     }
     #[cfg(not(target_arch = "aarch64"))]
     haar1_scalar(x, n0, stride);
@@ -225,19 +225,20 @@ pub fn haar1(x: &mut [f32], n0: usize, stride: usize) {
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "avx2")]
-unsafe fn haar1_avx2(x: &mut [f32], n0: usize) {
+fn haar1_avx2(x: &mut [f32], n0: usize) {
+    use crate::simd::x86::{load8, store8};
     #[cfg(target_arch = "x86")]
     use core::arch::x86::*;
     #[cfg(target_arch = "x86_64")]
     use core::arch::x86_64::*;
     let n = n0 >> 1;
+    let x = &mut x[..2 * n];
     let scale = _mm256_set1_ps(core::f32::consts::FRAC_1_SQRT_2);
     let fixup = _mm256_set_epi32(7, 6, 3, 2, 5, 4, 1, 0);
     let mut j = 0;
     while j + 8 <= n {
-        let ptr = x.as_mut_ptr().add(2 * j);
-        let a = _mm256_loadu_ps(ptr);
-        let b = _mm256_loadu_ps(ptr.add(8));
+        let a = load8(x, 2 * j);
+        let b = load8(x, 2 * j + 8);
 
         let t0 = _mm256_unpacklo_ps(a, b);
         let t1 = _mm256_unpackhi_ps(a, b);
@@ -256,8 +257,8 @@ unsafe fn haar1_avx2(x: &mut [f32], n0: usize) {
         let out0 = _mm256_permute2f128_ps(r0, r1, 0x20);
         let out1 = _mm256_permute2f128_ps(r0, r1, 0x31);
 
-        _mm256_storeu_ps(ptr, out0);
-        _mm256_storeu_ps(ptr.add(8), out1);
+        store8(x, 2 * j, out0);
+        store8(x, 2 * j + 8, out1);
         j += 8;
     }
 
@@ -291,36 +292,38 @@ fn haar1_scalar(x: &mut [f32], n0: usize, stride: usize) {
 }
 
 #[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
 fn haar1_neon(x: &mut [f32], n0: usize) {
+    use crate::simd::neon::{ld2x4, st2x4};
     use core::arch::aarch64::*;
+
+    let x = &mut x[..2 * (n0 >> 1)];
 
     let n = n0 >> 1;
     let scale = core::f32::consts::FRAC_1_SQRT_2;
 
-    unsafe {
-        let vscale = vdupq_n_f32(scale);
+    let vscale = vdupq_n_f32(scale);
 
-        let mut j = 0usize;
-        while j + 4 <= n {
-            let idx = 2 * j;
-            let pairs = vld2q_f32(x.as_ptr().add(idx));
-            let even = vmulq_f32(pairs.0, vscale);
-            let odd = vmulq_f32(pairs.1, vscale);
+    let mut j = 0usize;
+    while j + 4 <= n {
+        let idx = 2 * j;
+        let pairs = ld2x4(x, idx);
+        let even = vmulq_f32(pairs.0, vscale);
+        let odd = vmulq_f32(pairs.1, vscale);
 
-            let out = float32x4x2_t(vaddq_f32(even, odd), vsubq_f32(even, odd));
-            vst2q_f32(x.as_mut_ptr().add(idx), out);
-            j += 4;
-        }
+        let out = float32x4x2_t(vaddq_f32(even, odd), vsubq_f32(even, odd));
+        st2x4(x, idx, out);
+        j += 4;
+    }
 
-        while j < n {
-            let idx1 = 2 * j;
-            let idx2 = idx1 + 1;
-            let tmp1 = scale * x[idx1];
-            let tmp2 = scale * x[idx2];
-            x[idx1] = tmp1 + tmp2;
-            x[idx2] = tmp1 - tmp2;
-            j += 1;
-        }
+    while j < n {
+        let idx1 = 2 * j;
+        let idx2 = idx1 + 1;
+        let tmp1 = scale * x[idx1];
+        let tmp2 = scale * x[idx2];
+        x[idx1] = tmp1 + tmp2;
+        x[idx2] = tmp1 - tmp2;
+        j += 1;
     }
 }
 
@@ -350,10 +353,14 @@ pub fn compute_qn(n: usize, b: i32, offset: i32, pulse_cap: i32, stereo: bool) -
 }
 
 #[cfg(target_arch = "aarch64")]
-#[inline(always)]
-#[allow(unsafe_op_in_unsafe_fn)]
-unsafe fn stereo_itheta_neon(x: &[f32], y: &[f32], stereo: bool, n: usize) -> i32 {
+#[inline]
+#[target_feature(enable = "neon")]
+fn stereo_itheta_neon(x: &[f32], y: &[f32], stereo: bool, n: usize) -> i32 {
+    use crate::simd::neon::ld4;
     use core::arch::aarch64::*;
+
+    let x = &x[..n];
+    let y = &y[..n];
 
     let mut emid = 1e-15f32;
     let mut eside = 1e-15f32;
@@ -364,14 +371,14 @@ unsafe fn stereo_itheta_neon(x: &[f32], y: &[f32], stereo: bool, n: usize) -> i3
         let mut i = 0;
 
         while i + 16 <= n {
-            let x0 = vld1q_f32(x.as_ptr().add(i));
-            let x1 = vld1q_f32(x.as_ptr().add(i + 4));
-            let x2 = vld1q_f32(x.as_ptr().add(i + 8));
-            let x3 = vld1q_f32(x.as_ptr().add(i + 12));
-            let y0 = vld1q_f32(y.as_ptr().add(i));
-            let y1 = vld1q_f32(y.as_ptr().add(i + 4));
-            let y2 = vld1q_f32(y.as_ptr().add(i + 8));
-            let y3 = vld1q_f32(y.as_ptr().add(i + 12));
+            let x0 = ld4(x, i);
+            let x1 = ld4(x, i + 4);
+            let x2 = ld4(x, i + 8);
+            let x3 = ld4(x, i + 12);
+            let y0 = ld4(y, i);
+            let y1 = ld4(y, i + 4);
+            let y2 = ld4(y, i + 8);
+            let y3 = ld4(y, i + 12);
 
             let m0 = vaddq_f32(x0, y0);
             let m1 = vaddq_f32(x1, y1);
@@ -395,10 +402,10 @@ unsafe fn stereo_itheta_neon(x: &[f32], y: &[f32], stereo: bool, n: usize) -> i3
         }
 
         while i + 8 <= n {
-            let x0 = vld1q_f32(x.as_ptr().add(i));
-            let x1 = vld1q_f32(x.as_ptr().add(i + 4));
-            let y0 = vld1q_f32(y.as_ptr().add(i));
-            let y1 = vld1q_f32(y.as_ptr().add(i + 4));
+            let x0 = ld4(x, i);
+            let x1 = ld4(x, i + 4);
+            let y0 = ld4(y, i);
+            let y1 = ld4(y, i + 4);
 
             let m0 = vaddq_f32(x0, y0);
             let m1 = vaddq_f32(x1, y1);
@@ -414,8 +421,8 @@ unsafe fn stereo_itheta_neon(x: &[f32], y: &[f32], stereo: bool, n: usize) -> i3
         }
 
         while i + 4 <= n {
-            let x0 = vld1q_f32(x.as_ptr().add(i));
-            let y0 = vld1q_f32(y.as_ptr().add(i));
+            let x0 = ld4(x, i);
+            let y0 = ld4(y, i);
             let m0 = vaddq_f32(x0, y0);
             let s0 = vsubq_f32(x0, y0);
             sum_mid = vfmaq_f32(sum_mid, m0, m0);
@@ -438,14 +445,14 @@ unsafe fn stereo_itheta_neon(x: &[f32], y: &[f32], stereo: bool, n: usize) -> i3
         let mut i = 0;
 
         while i + 16 <= n {
-            let x0 = vld1q_f32(x.as_ptr().add(i));
-            let x1 = vld1q_f32(x.as_ptr().add(i + 4));
-            let x2 = vld1q_f32(x.as_ptr().add(i + 8));
-            let x3 = vld1q_f32(x.as_ptr().add(i + 12));
-            let y0 = vld1q_f32(y.as_ptr().add(i));
-            let y1 = vld1q_f32(y.as_ptr().add(i + 4));
-            let y2 = vld1q_f32(y.as_ptr().add(i + 8));
-            let y3 = vld1q_f32(y.as_ptr().add(i + 12));
+            let x0 = ld4(x, i);
+            let x1 = ld4(x, i + 4);
+            let x2 = ld4(x, i + 8);
+            let x3 = ld4(x, i + 12);
+            let y0 = ld4(y, i);
+            let y1 = ld4(y, i + 4);
+            let y2 = ld4(y, i + 8);
+            let y3 = ld4(y, i + 12);
 
             sum_mid = vfmaq_f32(sum_mid, x0, x0);
             sum_mid = vfmaq_f32(sum_mid, x1, x1);
@@ -460,10 +467,10 @@ unsafe fn stereo_itheta_neon(x: &[f32], y: &[f32], stereo: bool, n: usize) -> i3
         }
 
         while i + 8 <= n {
-            let x0 = vld1q_f32(x.as_ptr().add(i));
-            let x1 = vld1q_f32(x.as_ptr().add(i + 4));
-            let y0 = vld1q_f32(y.as_ptr().add(i));
-            let y1 = vld1q_f32(y.as_ptr().add(i + 4));
+            let x0 = ld4(x, i);
+            let x1 = ld4(x, i + 4);
+            let y0 = ld4(y, i);
+            let y1 = ld4(y, i + 4);
 
             sum_mid = vfmaq_f32(sum_mid, x0, x0);
             sum_mid = vfmaq_f32(sum_mid, x1, x1);
@@ -474,8 +481,8 @@ unsafe fn stereo_itheta_neon(x: &[f32], y: &[f32], stereo: bool, n: usize) -> i3
         }
 
         while i + 4 <= n {
-            let x0 = vld1q_f32(x.as_ptr().add(i));
-            let y0 = vld1q_f32(y.as_ptr().add(i));
+            let x0 = ld4(x, i);
+            let y0 = ld4(y, i);
             sum_mid = vfmaq_f32(sum_mid, x0, x0);
             sum_side = vfmaq_f32(sum_side, y0, y0);
             i += 4;
@@ -499,17 +506,13 @@ unsafe fn stereo_itheta_neon(x: &[f32], y: &[f32], stereo: bool, n: usize) -> i3
 #[inline(always)]
 #[cfg(target_arch = "aarch64")]
 pub fn stereo_itheta(x: &[f32], y: &[f32], stereo: bool, n: usize) -> i32 {
+    // SAFETY: NEON is part of the aarch64 baseline.
     unsafe { stereo_itheta_neon(x, y, stereo, n) }
 }
 
 #[inline(always)]
 #[cfg(not(target_arch = "aarch64"))]
 pub fn stereo_itheta(x: &[f32], y: &[f32], stereo: bool, n: usize) -> i32 {
-    #[cfg(target_arch = "aarch64")]
-    unsafe {
-        return stereo_itheta_neon(x, y, stereo, n);
-    }
-    #[cfg(not(target_arch = "aarch64"))]
     {
         let mut emid = 1e-15f32;
         let mut eside = 1e-15f32;
@@ -1355,40 +1358,10 @@ pub fn quant_partition(
                     x[..n].fill(0.0);
                 } else if let Some(lb) = lowband {
                     #[cfg(target_arch = "aarch64")]
+                    // SAFETY: NEON is part of the aarch64 baseline.
                     unsafe {
-                        use core::arch::aarch64::*;
-                        let n8 = n & !7;
-                        let mut i = 0;
-                        while i < n8 {
-                            let mut vals = [0.0f32; 8];
-                            for j in 0..8 {
-                                ctx.seed = celt_lcg_rand(ctx.seed);
-                                vals[j] = if ctx.seed & 0x8000 != 0 {
-                                    1.0 / 256.0
-                                } else {
-                                    -1.0 / 256.0
-                                };
-                            }
-                            let vnoise = vld1q_f32(vals.as_ptr());
-                            let vnoise1 = vld1q_f32(vals.as_ptr().add(4));
-                            let vlb = vld1q_f32(lb.as_ptr().add(i));
-                            let vlb1 = vld1q_f32(lb.as_ptr().add(i + 4));
-                            let vres = vaddq_f32(vlb, vnoise);
-                            let vres1 = vaddq_f32(vlb1, vnoise1);
-                            vst1q_f32(x.as_mut_ptr().add(i), vres);
-                            vst1q_f32(x.as_mut_ptr().add(i + 4), vres1);
-                            i += 8;
-                        }
-                        for j in i..n {
-                            ctx.seed = celt_lcg_rand(ctx.seed);
-                            x[j] = lb[j]
-                                + if ctx.seed & 0x8000 != 0 {
-                                    1.0 / 256.0
-                                } else {
-                                    -1.0 / 256.0
-                                };
-                        }
-                    }
+                        lowband_plus_noise_neon(x, lb, n, &mut ctx.seed)
+                    };
                     #[cfg(not(target_arch = "aarch64"))]
                     {
                         for j in 0..n {
@@ -1414,6 +1387,49 @@ pub fn quant_partition(
             }
             cm
         }
+    }
+}
+
+/// `x[j] = lb[j] ± 1/256`, the sign drawn from the band's LCG, eight at a
+/// time.
+#[cfg(target_arch = "aarch64")]
+#[inline]
+#[target_feature(enable = "neon")]
+fn lowband_plus_noise_neon(x: &mut [f32], lb: &[f32], n: usize, seed: &mut u32) {
+    use crate::simd::neon::{ld4, st4};
+    use core::arch::aarch64::*;
+    let x = &mut x[..n];
+    let lb = &lb[..n];
+    let n8 = n & !7;
+    let mut i = 0;
+    while i < n8 {
+        let mut vals = [0.0f32; 8];
+        for j in 0..8 {
+            *seed = celt_lcg_rand(*seed);
+            vals[j] = if *seed & 0x8000 != 0 {
+                1.0 / 256.0
+            } else {
+                -1.0 / 256.0
+            };
+        }
+        let vnoise = ld4(&vals, 0);
+        let vnoise1 = ld4(&vals, 4);
+        let vlb = ld4(lb, i);
+        let vlb1 = ld4(lb, i + 4);
+        let vres = vaddq_f32(vlb, vnoise);
+        let vres1 = vaddq_f32(vlb1, vnoise1);
+        st4(x, i, vres);
+        st4(x, i + 4, vres1);
+        i += 8;
+    }
+    for j in i..n {
+        *seed = celt_lcg_rand(*seed);
+        x[j] = lb[j]
+            + if *seed & 0x8000 != 0 {
+                1.0 / 256.0
+            } else {
+                -1.0 / 256.0
+            };
     }
 }
 
@@ -1831,142 +1847,6 @@ fn prepare_lowband_views<'a>(
     }
 
     (Some(&mut norm[lb_start..lb_end]), None)
-}
-
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2")]
-#[allow(dead_code)]
-unsafe fn stereo_merge_avx2(x: &mut [f32], y: &mut [f32], mid: f32, side: f32, n: usize) {
-    #[cfg(target_arch = "x86")]
-    use core::arch::x86::*;
-    #[cfg(target_arch = "x86_64")]
-    use core::arch::x86_64::*;
-
-    let mut i = 0;
-
-    let v_mid = _mm256_set1_ps(mid);
-    let v_side = _mm256_set1_ps(side);
-
-    while i + 15 < n {
-        let x0 = _mm256_loadu_ps(x.as_ptr().add(i));
-        let x1 = _mm256_loadu_ps(x.as_ptr().add(i + 8));
-        let y0 = _mm256_loadu_ps(y.as_ptr().add(i));
-        let y1 = _mm256_loadu_ps(y.as_ptr().add(i + 8));
-
-        let x_val0 = _mm256_mul_ps(x0, v_mid);
-        let x_val1 = _mm256_mul_ps(x1, v_mid);
-        let y_val0 = _mm256_mul_ps(y0, v_side);
-        let y_val1 = _mm256_mul_ps(y1, v_side);
-
-        let new_x0 = _mm256_sub_ps(x_val0, y_val0);
-        let new_x1 = _mm256_sub_ps(x_val1, y_val1);
-        let new_y0 = _mm256_add_ps(x_val0, y_val0);
-        let new_y1 = _mm256_add_ps(x_val1, y_val1);
-
-        _mm256_storeu_ps(x.as_mut_ptr().add(i), new_x0);
-        _mm256_storeu_ps(x.as_mut_ptr().add(i + 8), new_x1);
-        _mm256_storeu_ps(y.as_mut_ptr().add(i), new_y0);
-        _mm256_storeu_ps(y.as_mut_ptr().add(i + 8), new_y1);
-
-        i += 16;
-    }
-
-    while i + 7 < n {
-        let x0 = _mm256_loadu_ps(x.as_ptr().add(i));
-        let y0 = _mm256_loadu_ps(y.as_ptr().add(i));
-
-        let x_val = _mm256_mul_ps(x0, v_mid);
-        let y_val = _mm256_mul_ps(y0, v_side);
-
-        let new_x = _mm256_sub_ps(x_val, y_val);
-        let new_y = _mm256_add_ps(x_val, y_val);
-
-        _mm256_storeu_ps(x.as_mut_ptr().add(i), new_x);
-        _mm256_storeu_ps(y.as_mut_ptr().add(i), new_y);
-
-        i += 8;
-    }
-
-    for j in i..n {
-        let x_val = x[j] * mid;
-        let y_val = y[j] * side;
-        x[j] = x_val - y_val;
-        y[j] = x_val + y_val;
-    }
-}
-
-#[allow(dead_code)]
-#[inline]
-fn stereo_merge_scalar(x: &mut [f32], y: &mut [f32], mid: f32, side: f32, n: usize) {
-    for i in 0..n {
-        let x_val = x[i] * mid;
-        let y_val = y[i] * side;
-        x[i] = x_val - y_val;
-        y[i] = x_val + y_val;
-    }
-}
-
-#[cfg(target_arch = "aarch64")]
-#[allow(dead_code)]
-fn stereo_merge_neon(x: &mut [f32], y: &mut [f32], mid: f32, side: f32, n: usize) {
-    use core::arch::aarch64::*;
-
-    unsafe {
-        let vmid = vdupq_n_f32(mid);
-        let vside = vdupq_n_f32(side);
-
-        let n16 = n & !15;
-        for i in (0..n16).step_by(16) {
-            let x0 = vld1q_f32(x.as_ptr().add(i));
-            let x1 = vld1q_f32(x.as_ptr().add(i + 4));
-            let x2 = vld1q_f32(x.as_ptr().add(i + 8));
-            let x3 = vld1q_f32(x.as_ptr().add(i + 12));
-
-            let y0 = vld1q_f32(y.as_ptr().add(i));
-            let y1 = vld1q_f32(y.as_ptr().add(i + 4));
-            let y2 = vld1q_f32(y.as_ptr().add(i + 8));
-            let y3 = vld1q_f32(y.as_ptr().add(i + 12));
-
-            let xv0 = vmulq_f32(x0, vmid);
-            let xv1 = vmulq_f32(x1, vmid);
-            let xv2 = vmulq_f32(x2, vmid);
-            let xv3 = vmulq_f32(x3, vmid);
-
-            let yv0 = vmulq_f32(y0, vside);
-            let yv1 = vmulq_f32(y1, vside);
-            let yv2 = vmulq_f32(y2, vside);
-            let yv3 = vmulq_f32(y3, vside);
-
-            vst1q_f32(x.as_mut_ptr().add(i), vsubq_f32(xv0, yv0));
-            vst1q_f32(x.as_mut_ptr().add(i + 4), vsubq_f32(xv1, yv1));
-            vst1q_f32(x.as_mut_ptr().add(i + 8), vsubq_f32(xv2, yv2));
-            vst1q_f32(x.as_mut_ptr().add(i + 12), vsubq_f32(xv3, yv3));
-
-            vst1q_f32(y.as_mut_ptr().add(i), vaddq_f32(xv0, yv0));
-            vst1q_f32(y.as_mut_ptr().add(i + 4), vaddq_f32(xv1, yv1));
-            vst1q_f32(y.as_mut_ptr().add(i + 8), vaddq_f32(xv2, yv2));
-            vst1q_f32(y.as_mut_ptr().add(i + 12), vaddq_f32(xv3, yv3));
-        }
-
-        let n4 = (n & !3) - n16;
-        for i in (n16..n16 + n4).step_by(4) {
-            let xv = vld1q_f32(x.as_ptr().add(i));
-            let yv = vld1q_f32(y.as_ptr().add(i));
-
-            let x_val = vmulq_f32(xv, vmid);
-            let y_val = vmulq_f32(yv, vside);
-
-            vst1q_f32(x.as_mut_ptr().add(i), vsubq_f32(x_val, y_val));
-            vst1q_f32(y.as_mut_ptr().add(i), vaddq_f32(x_val, y_val));
-        }
-
-        for i in (n16 + n4)..n {
-            let x_val = x[i] * mid;
-            let y_val = y[i] * side;
-            x[i] = x_val - y_val;
-            y[i] = x_val + y_val;
-        }
-    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2449,52 +2329,52 @@ pub fn quant_all_bands(
 }
 
 #[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
 fn compute_band_energy_neon(band: &[f32]) -> f32 {
+    use crate::simd::neon::ld4;
     use core::arch::aarch64::*;
 
     let n = band.len();
     let mut sum = 1e-27f32;
 
-    unsafe {
-        let n16 = n & !15;
-        if n16 > 0 {
-            let mut acc0 = vdupq_n_f32(0.0);
-            let mut acc1 = vdupq_n_f32(0.0);
-            let mut acc2 = vdupq_n_f32(0.0);
-            let mut acc3 = vdupq_n_f32(0.0);
+    let n16 = n & !15;
+    if n16 > 0 {
+        let mut acc0 = vdupq_n_f32(0.0);
+        let mut acc1 = vdupq_n_f32(0.0);
+        let mut acc2 = vdupq_n_f32(0.0);
+        let mut acc3 = vdupq_n_f32(0.0);
 
-            for i in (0..n16).step_by(16) {
-                let v0 = vld1q_f32(band.as_ptr().add(i));
-                let v1 = vld1q_f32(band.as_ptr().add(i + 4));
-                let v2 = vld1q_f32(band.as_ptr().add(i + 8));
-                let v3 = vld1q_f32(band.as_ptr().add(i + 12));
+        for i in (0..n16).step_by(16) {
+            let v0 = ld4(band, i);
+            let v1 = ld4(band, i + 4);
+            let v2 = ld4(band, i + 8);
+            let v3 = ld4(band, i + 12);
 
-                acc0 = vfmaq_f32(acc0, v0, v0);
-                acc1 = vfmaq_f32(acc1, v1, v1);
-                acc2 = vfmaq_f32(acc2, v2, v2);
-                acc3 = vfmaq_f32(acc3, v3, v3);
-            }
-
-            acc0 = vaddq_f32(acc0, acc1);
-            acc2 = vaddq_f32(acc2, acc3);
-            acc0 = vaddq_f32(acc0, acc2);
-            sum += vaddvq_f32(acc0);
+            acc0 = vfmaq_f32(acc0, v0, v0);
+            acc1 = vfmaq_f32(acc1, v1, v1);
+            acc2 = vfmaq_f32(acc2, v2, v2);
+            acc3 = vfmaq_f32(acc3, v3, v3);
         }
 
-        let n4 = (n & !3) - n16;
-        if n4 > 0 {
-            let mut acc = vdupq_n_f32(0.0);
-            for i in (n16..n16 + n4).step_by(4) {
-                let v = vld1q_f32(band.as_ptr().add(i));
-                acc = vfmaq_f32(acc, v, v);
-            }
-            sum += vaddvq_f32(acc);
-        }
+        acc0 = vaddq_f32(acc0, acc1);
+        acc2 = vaddq_f32(acc2, acc3);
+        acc0 = vaddq_f32(acc0, acc2);
+        sum += vaddvq_f32(acc0);
+    }
 
-        for i in (n16 + n4)..n {
-            let v = band[i];
-            sum += v * v;
+    let n4 = (n & !3) - n16;
+    if n4 > 0 {
+        let mut acc = vdupq_n_f32(0.0);
+        for i in (n16..n16 + n4).step_by(4) {
+            let v = ld4(band, i);
+            acc = vfmaq_f32(acc, v, v);
         }
+        sum += vaddvq_f32(acc);
+    }
+
+    for i in (n16 + n4)..n {
+        let v = band[i];
+        sum += v * v;
     }
 
     sum.sqrt()
@@ -2502,7 +2382,8 @@ fn compute_band_energy_neon(band: &[f32]) -> f32 {
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
-unsafe fn compute_band_energy_avx2(band: &[f32]) -> f32 {
+fn compute_band_energy_avx2(band: &[f32]) -> f32 {
+    use crate::simd::x86::load8;
     #[cfg(target_arch = "x86")]
     use core::arch::x86::*;
     #[cfg(target_arch = "x86_64")]
@@ -2515,15 +2396,15 @@ unsafe fn compute_band_energy_avx2(band: &[f32]) -> f32 {
     let mut acc1 = _mm256_setzero_ps();
 
     while i + 16 <= n {
-        let v0 = _mm256_loadu_ps(band.as_ptr().add(i));
-        let v1 = _mm256_loadu_ps(band.as_ptr().add(i + 8));
+        let v0 = load8(band, i);
+        let v1 = load8(band, i + 8);
         acc0 = _mm256_fmadd_ps(v0, v0, acc0);
         acc1 = _mm256_fmadd_ps(v1, v1, acc1);
         i += 16;
     }
 
     if i + 8 <= n {
-        let v0 = _mm256_loadu_ps(band.as_ptr().add(i));
+        let v0 = load8(band, i);
         acc0 = _mm256_fmadd_ps(v0, v0, acc0);
         i += 8;
     }
@@ -2566,11 +2447,13 @@ pub fn compute_band_energies(
 
             #[cfg(target_arch = "aarch64")]
             {
-                band_e[c * m.nb_ebands + i] = compute_band_energy_neon(band);
+                // SAFETY: NEON is part of the aarch64 baseline.
+                band_e[c * m.nb_ebands + i] = unsafe { compute_band_energy_neon(band) };
             }
             #[cfg(target_arch = "x86_64")]
             {
                 if n >= 8 && use_avx2 {
+                    // SAFETY: the CPU supports AVX2 and FMA (`use_avx2`).
                     band_e[c * m.nb_ebands + i] = unsafe { compute_band_energy_avx2(band) };
                 } else {
                     let sum = band.iter().fold(1e-27f32, |acc, &v| acc + v * v);
@@ -2635,11 +2518,13 @@ pub fn normalise_bands(
             let dst = &mut x[base..base + n];
             #[cfg(target_arch = "x86_64")]
             if n >= 8 && use_avx2 {
+                // SAFETY: the CPU supports AVX2 (`use_avx2`).
                 unsafe { scale_slice_avx2(src, dst, norm, n) };
                 continue;
             }
             #[cfg(target_arch = "aarch64")]
             if n >= 8 {
+                // SAFETY: NEON is part of the aarch64 baseline.
                 unsafe { scale_slice_neon(src, dst, norm, n) };
                 continue;
             }
@@ -2652,24 +2537,27 @@ pub fn normalise_bands(
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-unsafe fn scale_slice_avx2(src: &[f32], dst: &mut [f32], scale: f32, n: usize) {
+fn scale_slice_avx2(src: &[f32], dst: &mut [f32], scale: f32, n: usize) {
+    use crate::simd::x86::{load8, store8};
     #[cfg(target_arch = "x86")]
     use core::arch::x86::*;
     #[cfg(target_arch = "x86_64")]
     use core::arch::x86_64::*;
+    let src = &src[..n];
+    let dst = &mut dst[..n];
     let vscale = _mm256_set1_ps(scale);
     let mut i = 0;
 
     while i + 16 <= n {
-        let s0 = _mm256_loadu_ps(src.as_ptr().add(i));
-        let s1 = _mm256_loadu_ps(src.as_ptr().add(i + 8));
-        _mm256_storeu_ps(dst.as_mut_ptr().add(i), _mm256_mul_ps(s0, vscale));
-        _mm256_storeu_ps(dst.as_mut_ptr().add(i + 8), _mm256_mul_ps(s1, vscale));
+        let s0 = load8(src, i);
+        let s1 = load8(src, i + 8);
+        store8(dst, i, _mm256_mul_ps(s0, vscale));
+        store8(dst, i + 8, _mm256_mul_ps(s1, vscale));
         i += 16;
     }
     while i + 8 <= n {
-        let sv = _mm256_loadu_ps(src.as_ptr().add(i));
-        _mm256_storeu_ps(dst.as_mut_ptr().add(i), _mm256_mul_ps(sv, vscale));
+        let sv = load8(src, i);
+        store8(dst, i, _mm256_mul_ps(sv, vscale));
         i += 8;
     }
     for j in i..n {
@@ -2678,34 +2566,38 @@ unsafe fn scale_slice_avx2(src: &[f32], dst: &mut [f32], scale: f32, n: usize) {
 }
 
 #[cfg(target_arch = "aarch64")]
-#[inline(always)]
-#[allow(unsafe_op_in_unsafe_fn)]
-unsafe fn scale_slice_neon(src: &[f32], dst: &mut [f32], scale: f32, n: usize) {
+#[inline]
+#[target_feature(enable = "neon")]
+fn scale_slice_neon(src: &[f32], dst: &mut [f32], scale: f32, n: usize) {
+    use crate::simd::neon::{ld4, st4};
     use core::arch::aarch64::*;
+
+    let src = &src[..n];
+    let dst = &mut dst[..n];
     let vscale = vdupq_n_f32(scale);
     let mut i = 0;
 
     while i + 16 <= n {
-        let s0 = vld1q_f32(src.as_ptr().add(i));
-        let s1 = vld1q_f32(src.as_ptr().add(i + 4));
-        let s2 = vld1q_f32(src.as_ptr().add(i + 8));
-        let s3 = vld1q_f32(src.as_ptr().add(i + 12));
-        vst1q_f32(dst.as_mut_ptr().add(i), vmulq_f32(s0, vscale));
-        vst1q_f32(dst.as_mut_ptr().add(i + 4), vmulq_f32(s1, vscale));
-        vst1q_f32(dst.as_mut_ptr().add(i + 8), vmulq_f32(s2, vscale));
-        vst1q_f32(dst.as_mut_ptr().add(i + 12), vmulq_f32(s3, vscale));
+        let s0 = ld4(src, i);
+        let s1 = ld4(src, i + 4);
+        let s2 = ld4(src, i + 8);
+        let s3 = ld4(src, i + 12);
+        st4(dst, i, vmulq_f32(s0, vscale));
+        st4(dst, i + 4, vmulq_f32(s1, vscale));
+        st4(dst, i + 8, vmulq_f32(s2, vscale));
+        st4(dst, i + 12, vmulq_f32(s3, vscale));
         i += 16;
     }
     while i + 8 <= n {
-        let s0 = vld1q_f32(src.as_ptr().add(i));
-        let s1 = vld1q_f32(src.as_ptr().add(i + 4));
-        vst1q_f32(dst.as_mut_ptr().add(i), vmulq_f32(s0, vscale));
-        vst1q_f32(dst.as_mut_ptr().add(i + 4), vmulq_f32(s1, vscale));
+        let s0 = ld4(src, i);
+        let s1 = ld4(src, i + 4);
+        st4(dst, i, vmulq_f32(s0, vscale));
+        st4(dst, i + 4, vmulq_f32(s1, vscale));
         i += 8;
     }
     while i + 4 <= n {
-        let s0 = vld1q_f32(src.as_ptr().add(i));
-        vst1q_f32(dst.as_mut_ptr().add(i), vmulq_f32(s0, vscale));
+        let s0 = ld4(src, i);
+        st4(dst, i, vmulq_f32(s0, vscale));
         i += 4;
     }
     for j in i..n {
@@ -2741,11 +2633,13 @@ pub fn denormalise_bands(
             let dst = &mut freq[base..base + n];
             #[cfg(target_arch = "x86_64")]
             if n >= 8 && use_avx2 {
+                // SAFETY: the CPU supports AVX2 (`use_avx2`).
                 unsafe { scale_slice_avx2(src, dst, g, n) };
                 continue;
             }
             #[cfg(target_arch = "aarch64")]
             if n >= 8 {
+                // SAFETY: NEON is part of the aarch64 baseline.
                 unsafe { scale_slice_neon(src, dst, g, n) };
                 continue;
             }
@@ -2761,19 +2655,22 @@ pub fn celt_lcg_rand(seed: u32) -> u32 {
 }
 
 #[cfg(target_arch = "aarch64")]
-#[inline(always)]
-#[allow(unsafe_op_in_unsafe_fn)]
-unsafe fn renormalise_vector_neon(x: &mut [f32], n: usize, gain: f32) {
+#[inline]
+#[target_feature(enable = "neon")]
+fn renormalise_vector_neon(x: &mut [f32], n: usize, gain: f32) {
+    use crate::simd::neon::{ld4, st4};
     use core::arch::aarch64::*;
+
+    let x = &mut x[..n];
 
     let mut sum_vec = vdupq_n_f32(0.0);
     let mut i = 0;
 
     while i + 16 <= n {
-        let x0 = vld1q_f32(x.as_ptr().add(i));
-        let x1 = vld1q_f32(x.as_ptr().add(i + 4));
-        let x2 = vld1q_f32(x.as_ptr().add(i + 8));
-        let x3 = vld1q_f32(x.as_ptr().add(i + 12));
+        let x0 = ld4(x, i);
+        let x1 = ld4(x, i + 4);
+        let x2 = ld4(x, i + 8);
+        let x3 = ld4(x, i + 12);
         sum_vec = vfmaq_f32(sum_vec, x0, x0);
         sum_vec = vfmaq_f32(sum_vec, x1, x1);
         sum_vec = vfmaq_f32(sum_vec, x2, x2);
@@ -2782,15 +2679,15 @@ unsafe fn renormalise_vector_neon(x: &mut [f32], n: usize, gain: f32) {
     }
 
     while i + 8 <= n {
-        let x0 = vld1q_f32(x.as_ptr().add(i));
-        let x1 = vld1q_f32(x.as_ptr().add(i + 4));
+        let x0 = ld4(x, i);
+        let x1 = ld4(x, i + 4);
         sum_vec = vfmaq_f32(sum_vec, x0, x0);
         sum_vec = vfmaq_f32(sum_vec, x1, x1);
         i += 8;
     }
 
     while i + 4 <= n {
-        let x0 = vld1q_f32(x.as_ptr().add(i));
+        let x0 = ld4(x, i);
         sum_vec = vfmaq_f32(sum_vec, x0, x0);
         i += 4;
     }
@@ -2806,28 +2703,28 @@ unsafe fn renormalise_vector_neon(x: &mut [f32], n: usize, gain: f32) {
 
     i = 0;
     while i + 16 <= n {
-        let x0 = vld1q_f32(x.as_ptr().add(i));
-        let x1 = vld1q_f32(x.as_ptr().add(i + 4));
-        let x2 = vld1q_f32(x.as_ptr().add(i + 8));
-        let x3 = vld1q_f32(x.as_ptr().add(i + 12));
-        vst1q_f32(x.as_mut_ptr().add(i), vmulq_f32(x0, vnorm));
-        vst1q_f32(x.as_mut_ptr().add(i + 4), vmulq_f32(x1, vnorm));
-        vst1q_f32(x.as_mut_ptr().add(i + 8), vmulq_f32(x2, vnorm));
-        vst1q_f32(x.as_mut_ptr().add(i + 12), vmulq_f32(x3, vnorm));
+        let x0 = ld4(x, i);
+        let x1 = ld4(x, i + 4);
+        let x2 = ld4(x, i + 8);
+        let x3 = ld4(x, i + 12);
+        st4(x, i, vmulq_f32(x0, vnorm));
+        st4(x, i + 4, vmulq_f32(x1, vnorm));
+        st4(x, i + 8, vmulq_f32(x2, vnorm));
+        st4(x, i + 12, vmulq_f32(x3, vnorm));
         i += 16;
     }
 
     while i + 8 <= n {
-        let x0 = vld1q_f32(x.as_ptr().add(i));
-        let x1 = vld1q_f32(x.as_ptr().add(i + 4));
-        vst1q_f32(x.as_mut_ptr().add(i), vmulq_f32(x0, vnorm));
-        vst1q_f32(x.as_mut_ptr().add(i + 4), vmulq_f32(x1, vnorm));
+        let x0 = ld4(x, i);
+        let x1 = ld4(x, i + 4);
+        st4(x, i, vmulq_f32(x0, vnorm));
+        st4(x, i + 4, vmulq_f32(x1, vnorm));
         i += 8;
     }
 
     while i + 4 <= n {
-        let x0 = vld1q_f32(x.as_ptr().add(i));
-        vst1q_f32(x.as_mut_ptr().add(i), vmulq_f32(x0, vnorm));
+        let x0 = ld4(x, i);
+        st4(x, i, vmulq_f32(x0, vnorm));
         i += 4;
     }
 
@@ -2838,27 +2735,29 @@ unsafe fn renormalise_vector_neon(x: &mut [f32], n: usize, gain: f32) {
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
-unsafe fn renormalise_vector_avx2(x: &mut [f32], n: usize, gain: f32) {
+fn renormalise_vector_avx2(x: &mut [f32], n: usize, gain: f32) {
+    use crate::simd::x86::{load8, store8};
     #[cfg(target_arch = "x86")]
     use core::arch::x86::*;
     #[cfg(target_arch = "x86_64")]
     use core::arch::x86_64::*;
 
+    let x = &mut x[..n];
     let mut i = 0usize;
 
     let mut acc0 = _mm256_setzero_ps();
     let mut acc1 = _mm256_setzero_ps();
 
     while i + 16 <= n {
-        let v0 = _mm256_loadu_ps(x.as_ptr().add(i));
-        let v1 = _mm256_loadu_ps(x.as_ptr().add(i + 8));
+        let v0 = load8(x, i);
+        let v1 = load8(x, i + 8);
         acc0 = _mm256_fmadd_ps(v0, v0, acc0);
         acc1 = _mm256_fmadd_ps(v1, v1, acc1);
         i += 16;
     }
 
     if i + 8 <= n {
-        let v0 = _mm256_loadu_ps(x.as_ptr().add(i));
+        let v0 = load8(x, i);
         acc0 = _mm256_fmadd_ps(v0, v0, acc0);
         i += 8;
     }
@@ -2881,15 +2780,15 @@ unsafe fn renormalise_vector_avx2(x: &mut [f32], n: usize, gain: f32) {
 
     i = 0;
     while i + 16 <= n {
-        let v0 = _mm256_loadu_ps(x.as_ptr().add(i));
-        let v1 = _mm256_loadu_ps(x.as_ptr().add(i + 8));
-        _mm256_storeu_ps(x.as_mut_ptr().add(i), _mm256_mul_ps(v0, vnorm));
-        _mm256_storeu_ps(x.as_mut_ptr().add(i + 8), _mm256_mul_ps(v1, vnorm));
+        let v0 = load8(x, i);
+        let v1 = load8(x, i + 8);
+        store8(x, i, _mm256_mul_ps(v0, vnorm));
+        store8(x, i + 8, _mm256_mul_ps(v1, vnorm));
         i += 16;
     }
     while i + 8 <= n {
-        let v = _mm256_loadu_ps(x.as_ptr().add(i));
-        _mm256_storeu_ps(x.as_mut_ptr().add(i), _mm256_mul_ps(v, vnorm));
+        let v = load8(x, i);
+        store8(x, i, _mm256_mul_ps(v, vnorm));
         i += 8;
     }
     for v in &mut x[i..n] {
@@ -2899,15 +2798,15 @@ unsafe fn renormalise_vector_avx2(x: &mut [f32], n: usize, gain: f32) {
 
 pub fn renormalise_vector(x: &mut [f32], n: usize, gain: f32) {
     #[cfg(target_arch = "aarch64")]
+    // SAFETY: NEON is part of the aarch64 baseline.
     unsafe {
-        renormalise_vector_neon(x, n, gain);
-    }
+        renormalise_vector_neon(x, n, gain)
+    };
     #[cfg(target_arch = "x86_64")]
-    unsafe {
-        if n >= 16 && crate::compat::x86_has_avx2_fma() {
-            renormalise_vector_avx2(x, n, gain);
-            return;
-        }
+    if n >= 16 && crate::compat::x86_has_avx2_fma() {
+        // SAFETY: the CPU supports AVX2 and FMA, checked just above.
+        unsafe { renormalise_vector_avx2(x, n, gain) };
+        return;
     }
     #[cfg(all(not(target_arch = "aarch64"), not(target_arch = "x86_64")))]
     {
