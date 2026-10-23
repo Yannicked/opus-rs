@@ -1,6 +1,6 @@
 use crate::kiss_fft::{KissCpx, KissFftState, opus_fft_impl};
+use crate::scratch::{self, zeroed_prefix};
 use core::f32::consts::PI;
-use core::mem::MaybeUninit;
 
 #[cfg(not(feature = "std"))]
 use crate::compat::Math;
@@ -92,12 +92,10 @@ impl MdctLookup {
         let (trig, _) = self.get_trig(shift);
         let overlap2 = overlap / 2;
 
-        let mut f_buf = [MaybeUninit::<f32>::uninit(); MAX_N2];
-        let mut f2_buf = [MaybeUninit::<KissCpx>::uninit(); MAX_N4];
-
-        let f = unsafe { core::slice::from_raw_parts_mut(f_buf.as_mut_ptr() as *mut f32, n2) };
-        let f2 =
-            unsafe { core::slice::from_raw_parts_mut(f2_buf.as_mut_ptr() as *mut KissCpx, n4) };
+        let mut f_buf = scratch::uninit::<f32, MAX_N2>();
+        let mut f2_buf = scratch::uninit::<KissCpx, MAX_N4>();
+        let f = zeroed_prefix(&mut f_buf, n2);
+        let f2 = zeroed_prefix(&mut f2_buf, n4);
 
         // The pre-rotation windowed reads span n2 + overlap samples (libopus
         // reads input[xp1] with xp1 up to n2-1+overlap2 and the NEON paths
@@ -314,10 +312,8 @@ impl MdctLookup {
 
         let (trig, _) = self.get_trig(shift);
 
-        let mut f2_buf = [MaybeUninit::<KissCpx>::uninit(); MAX_N4];
-
-        let f2 =
-            unsafe { core::slice::from_raw_parts_mut(f2_buf.as_mut_ptr() as *mut KissCpx, n4) };
+        let mut f2_buf = scratch::uninit::<KissCpx, MAX_N4>();
+        let f2 = zeroed_prefix(&mut f2_buf, n4);
 
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         unsafe {

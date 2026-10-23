@@ -2,6 +2,7 @@ use crate::modes::CeltMode;
 use crate::pvq::*;
 use crate::range_coder::RangeCoder;
 use crate::rate::{BITRES, bits2pulses, get_pulses, pulses2bits};
+use crate::scratch::{self, zeroed_prefix};
 use crate::tell_frac_inline;
 
 #[cfg(not(feature = "std"))]
@@ -1430,10 +1431,10 @@ pub fn quant_partition(
 
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
-unsafe fn deinterleave_hadamard_neon(x: &mut [f32], n0: usize, stride: usize) {
+fn deinterleave_hadamard_neon(x: &mut [f32], n0: usize, stride: usize) {
     let n = n0 * stride;
-    let mut tmp_buf = [core::mem::MaybeUninit::<f32>::uninit(); MAX_PVQ_N];
-    let tmp = core::slice::from_raw_parts_mut(tmp_buf.as_mut_ptr() as *mut f32, n);
+    let mut tmp_buf = scratch::uninit::<f32, MAX_PVQ_N>();
+    let tmp = zeroed_prefix(&mut tmp_buf, n);
 
     for i in 0..stride {
         let src_offset = i;
@@ -1449,9 +1450,8 @@ unsafe fn deinterleave_hadamard_neon(x: &mut [f32], n0: usize, stride: usize) {
 pub fn deinterleave_hadamard(x: &mut [f32], n0: usize, stride: usize, hadamard: bool) {
     let n = n0 * stride;
 
-    let mut tmp_buf = [core::mem::MaybeUninit::<f32>::uninit(); MAX_PVQ_N];
-
-    let tmp = unsafe { core::slice::from_raw_parts_mut(tmp_buf.as_mut_ptr() as *mut f32, n) };
+    let mut tmp_buf = scratch::uninit::<f32, MAX_PVQ_N>();
+    let tmp = zeroed_prefix(&mut tmp_buf, n);
     if hadamard {
         let offset = match stride {
             2 => 0,
@@ -1468,11 +1468,9 @@ pub fn deinterleave_hadamard(x: &mut [f32], n0: usize, stride: usize, hadamard: 
         }
     } else {
         #[cfg(target_arch = "aarch64")]
-        unsafe {
-            if n0 >= 4 {
-                deinterleave_hadamard_neon(x, n0, stride);
-                return;
-            }
+        if n0 >= 4 {
+            deinterleave_hadamard_neon(x, n0, stride);
+            return;
         }
         for i in 0..stride {
             for j in 0..n0 {
@@ -1485,10 +1483,10 @@ pub fn deinterleave_hadamard(x: &mut [f32], n0: usize, stride: usize, hadamard: 
 
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
-unsafe fn interleave_hadamard_neon(x: &mut [f32], n0: usize, stride: usize) {
+fn interleave_hadamard_neon(x: &mut [f32], n0: usize, stride: usize) {
     let n = n0 * stride;
-    let mut tmp_buf = [core::mem::MaybeUninit::<f32>::uninit(); MAX_PVQ_N];
-    let tmp = core::slice::from_raw_parts_mut(tmp_buf.as_mut_ptr() as *mut f32, n);
+    let mut tmp_buf = scratch::uninit::<f32, MAX_PVQ_N>();
+    let tmp = zeroed_prefix(&mut tmp_buf, n);
 
     for i in 0..stride {
         let src_offset = i * n0;
@@ -1503,8 +1501,8 @@ unsafe fn interleave_hadamard_neon(x: &mut [f32], n0: usize, stride: usize) {
 
 pub fn interleave_hadamard(x: &mut [f32], n0: usize, stride: usize, hadamard: bool) {
     let n = n0 * stride;
-    let mut tmp_buf = [core::mem::MaybeUninit::<f32>::uninit(); MAX_PVQ_N];
-    let tmp = unsafe { core::slice::from_raw_parts_mut(tmp_buf.as_mut_ptr() as *mut f32, n) };
+    let mut tmp_buf = scratch::uninit::<f32, MAX_PVQ_N>();
+    let tmp = zeroed_prefix(&mut tmp_buf, n);
     if hadamard {
         let offset = match stride {
             2 => 0,
@@ -1521,11 +1519,9 @@ pub fn interleave_hadamard(x: &mut [f32], n0: usize, stride: usize, hadamard: bo
         }
     } else {
         #[cfg(target_arch = "aarch64")]
-        unsafe {
-            if n0 >= 4 {
-                interleave_hadamard_neon(x, n0, stride);
-                return;
-            }
+        if n0 >= 4 {
+            interleave_hadamard_neon(x, n0, stride);
+            return;
         }
         for i in 0..stride {
             for j in 0..n0 {
@@ -1792,15 +1788,15 @@ fn special_hybrid_folding(m: &CeltMode, norm: &mut [f32], start: usize, m_val: u
     }
 }
 
-fn prepare_lowband_views(
-    norm: &mut [f32],
-    lowband_scratch_ptr: *mut f32,
+fn prepare_lowband_views<'a>(
+    norm: &'a mut [f32],
+    lowband_scratch: &'a mut [f32; MAX_PVQ_N],
     allow_lowband_scratch: bool,
     effective_lowband: i32,
     norm_pos: usize,
     n: usize,
     want_out: bool,
-) -> (Option<&mut [f32]>, Option<&mut [f32]>) {
+) -> (Option<&'a mut [f32]>, Option<&'a mut [f32]>) {
     let len = norm.len();
     let out_range = if want_out && norm_pos + n <= len {
         Some((norm_pos, norm_pos + n))
@@ -1823,10 +1819,9 @@ fn prepare_lowband_views(
     }
 
     if allow_lowband_scratch {
-        unsafe {
-            core::ptr::copy_nonoverlapping(norm.as_ptr().add(lb_start), lowband_scratch_ptr, n)
-        };
-        let lb = Some(unsafe { core::slice::from_raw_parts_mut(lowband_scratch_ptr, n) });
+        let lb = &mut lowband_scratch[..n];
+        lb.copy_from_slice(&norm[lb_start..lb_end]);
+        let lb = Some(lb);
         let lb_out = out_range.map(|(s, e)| &mut norm[s..e]);
         return (lb, lb_out);
     }
@@ -2239,15 +2234,14 @@ pub fn quant_all_bands(
     const MAX_NORM_SIZE: usize = 800;
     debug_assert!(norm_size <= MAX_NORM_SIZE);
 
-    let mut norm_buf = [core::mem::MaybeUninit::<f32>::uninit(); MAX_NORM_SIZE];
-    let norm =
-        unsafe { core::slice::from_raw_parts_mut(norm_buf.as_mut_ptr() as *mut f32, norm_size) };
-    let mut norm2_buf = [core::mem::MaybeUninit::<f32>::uninit(); MAX_NORM_SIZE];
-    let norm2 =
-        unsafe { core::slice::from_raw_parts_mut(norm2_buf.as_mut_ptr() as *mut f32, norm_size) };
+    let mut norm_buf = scratch::uninit::<f32, MAX_NORM_SIZE>();
+    let norm = zeroed_prefix(&mut norm_buf, norm_size);
+    let mut norm2_buf = scratch::uninit::<f32, MAX_NORM_SIZE>();
+    let norm2 = zeroed_prefix(&mut norm2_buf, norm_size);
 
-    let mut lowband_scratch_buf = [core::mem::MaybeUninit::<f32>::uninit(); MAX_PVQ_N];
-    let lowband_scratch_ptr = lowband_scratch_buf.as_mut_ptr() as *mut f32;
+    // Only the first `n` elements are used per band; zeroing it once per
+    // frame is cheap next to the band coding.
+    let mut lowband_scratch = [0.0f32; MAX_PVQ_N];
 
     let mut lowband_offset: usize = 0;
     let mut update_lowband = true;
@@ -2371,7 +2365,7 @@ pub fn quant_all_bands(
 
             let (lb_x, lb_out_x) = prepare_lowband_views(
                 norm,
-                lowband_scratch_ptr,
+                &mut lowband_scratch,
                 allow_lowband_scratch,
                 effective_lowband,
                 norm_pos,
@@ -2393,7 +2387,7 @@ pub fn quant_all_bands(
 
             let (lb_y, lb_out_y) = prepare_lowband_views(
                 norm2,
-                lowband_scratch_ptr,
+                &mut lowband_scratch,
                 allow_lowband_scratch,
                 effective_lowband,
                 norm_pos,
@@ -2416,7 +2410,7 @@ pub fn quant_all_bands(
             let y_slice = &mut y_all[offset..offset + n];
             let (lb, lb_out) = prepare_lowband_views(
                 norm,
-                lowband_scratch_ptr,
+                &mut lowband_scratch,
                 allow_lowband_scratch,
                 effective_lowband,
                 norm_pos,
@@ -2440,7 +2434,7 @@ pub fn quant_all_bands(
         } else {
             let (lb, lb_out) = prepare_lowband_views(
                 norm,
-                lowband_scratch_ptr,
+                &mut lowband_scratch,
                 allow_lowband_scratch,
                 effective_lowband,
                 norm_pos,

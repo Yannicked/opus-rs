@@ -5,6 +5,7 @@
 
 mod compat;
 mod fixedvec;
+mod scratch;
 
 pub mod bands;
 pub mod celt;
