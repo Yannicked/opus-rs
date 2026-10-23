@@ -23,6 +23,16 @@ pub(crate) mod lanes {
     pub(crate) fn fmadd(a: f32, b: f32, c: f32) -> f32 {
         a.mul_add(b, c)
     }
+
+    /// Sum of eight lanes in the AVX kernels' order: the 128-bit halves
+    /// first, then lanes 0+2 and 1+3, then those two. Out of line so the
+    /// caller's accumulators stay 256-bit: inlined, LLVM's SLP vectorizer
+    /// narrows them to 128-bit to match this 4-wide first step.
+    #[inline(never)]
+    pub(crate) fn hsum8(a: [f32; 8]) -> f32 {
+        let s4 = [a[0] + a[4], a[1] + a[5], a[2] + a[6], a[3] + a[7]];
+        (s4[0] + s4[2]) + (s4[1] + s4[3])
+    }
 }
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]

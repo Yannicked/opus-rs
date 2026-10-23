@@ -910,37 +910,33 @@ fn sum_sq_plus_one_neon(y: &[f32], len: usize) -> f32 {
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "avx")]
 fn sum_sq_plus_one_avx(y: &[f32], len: usize) -> f32 {
-    use crate::simd::x86::load8;
-    #[cfg(target_arch = "x86")]
-    use core::arch::x86::*;
-    #[cfg(target_arch = "x86_64")]
-    use core::arch::x86_64::*;
-    let mut acc0 = _mm256_setzero_ps();
-    let mut acc1 = _mm256_setzero_ps();
-    let mut j = 0;
-    while j + 16 <= len {
-        let y0 = load8(y, j);
-        let y1 = load8(y, j + 8);
-        acc0 = _mm256_add_ps(acc0, _mm256_mul_ps(y0, y0));
-        acc1 = _mm256_add_ps(acc1, _mm256_mul_ps(y1, y1));
-        j += 16;
+    // Plain code compiled for AVX: two eight-lane accumulators of y*y
+    // (multiply then add, unfused), reduced in the old kernel's lane order.
+    use crate::simd::lanes::hsum8;
+    let y = &y[..len];
+    let mut acc0 = [0.0f32; 8];
+    let mut acc1 = [0.0f32; 8];
+    let (blocks, rest) = y.as_chunks::<16>();
+    for c in blocks {
+        for k in 0..8 {
+            acc0[k] += c[k] * c[k];
+            acc1[k] += c[8 + k] * c[8 + k];
+        }
     }
-    while j + 8 <= len {
-        let y0 = load8(y, j);
-        acc0 = _mm256_add_ps(acc0, _mm256_mul_ps(y0, y0));
-        j += 8;
+    let mut rest = rest;
+    if let Some((c, r)) = rest.split_first_chunk::<8>() {
+        for k in 0..8 {
+            acc0[k] += c[k] * c[k];
+        }
+        rest = r;
     }
-    let acc = _mm256_add_ps(acc0, acc1);
-    let hi = _mm256_extractf128_ps(acc, 1);
-    let lo = _mm256_castps256_ps128(acc);
-    let sum4 = _mm_add_ps(lo, hi);
-    let tmp = _mm_movehl_ps(sum4, sum4);
-    let sum2 = _mm_add_ps(sum4, tmp);
-    let tmp2 = _mm_shuffle_ps(sum2, sum2, 0x55);
-    let mut sum = 1.0f32 + _mm_cvtss_f32(_mm_add_ss(sum2, tmp2));
-    while j < len {
-        sum += y[j] * y[j];
-        j += 1;
+    let mut acc = [0.0f32; 8];
+    for k in 0..8 {
+        acc[k] = acc0[k] + acc1[k];
+    }
+    let mut sum = 1.0f32 + hsum8(acc);
+    for &v in rest {
+        sum += v * v;
     }
     sum
 }
