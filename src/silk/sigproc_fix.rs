@@ -104,8 +104,9 @@ pub fn silk_biquad_alt_stride2(
     len: usize,
 ) {
     #[cfg(target_arch = "aarch64")]
+    // SAFETY: NEON is part of the aarch64 baseline.
     unsafe {
-        silk_biquad_alt_stride2_neon(input_output, b_q28, a_q28, s, len);
+        silk_biquad_alt_stride2_neon(input_output, b_q28, a_q28, s, len)
     }
     #[cfg(not(target_arch = "aarch64"))]
     {
@@ -143,12 +144,12 @@ pub fn silk_biquad_alt_stride2(
 fn xcorr_kernel_c(x: &[i16], y: &[i16], sum: &mut [i32; 4], len: usize) {
     #[cfg(target_arch = "aarch64")]
     {
-        unsafe {
-            xcorr_kernel_neon_s16(x, y, sum, len);
-        }
+        // SAFETY: NEON is part of the aarch64 baseline.
+        unsafe { xcorr_kernel_neon_s16(x, y, sum, len) };
     }
     #[cfg(target_arch = "x86_64")]
     if crate::compat::x86_has_avx2() {
+        // SAFETY: the CPU supports AVX2, checked just above.
         unsafe { xcorr_kernel_avx2(x, y, sum, len) };
         return;
     }
@@ -229,54 +230,55 @@ fn xcorr_kernel_scalar(x: &[i16], y: &[i16], sum: &mut [i32; 4], len: usize) {
 }
 
 #[cfg(target_arch = "aarch64")]
-#[inline(always)]
-#[allow(unsafe_op_in_unsafe_fn)]
-unsafe fn xcorr_kernel_neon_s16(x: &[i16], y: &[i16], sum: &mut [i32; 4], mut len: usize) {
+#[inline]
+#[target_feature(enable = "neon")]
+fn xcorr_kernel_neon_s16(x: &[i16], y: &[i16], sum: &mut [i32; 4], mut len: usize) {
+    use crate::simd::neon::{ld4_s32, ld8_s16, st4_s32};
     use core::arch::aarch64::*;
 
     debug_assert!(x.len() >= len);
     debug_assert!(y.len() >= len + 3);
 
-    let mut acc = vld1q_s32(sum.as_ptr());
+    let mut acc = ld4_s32(sum, 0);
 
-    let mut xi = x.as_ptr();
-    let mut yi = y.as_ptr();
+    let mut xi = 0usize;
+    let mut yi = 0usize;
 
-    let mut yy = vld1q_s16(yi);
+    let mut yy = ld8_s16(y, yi);
 
     while len > 4 {
-        yi = yi.add(4);
-        let yy1 = vld1q_s16(yi);
+        yi += 4;
+        let yy1 = ld8_s16(y, yi);
 
-        let xj0 = vld1_dup_s16(xi);
+        let xj0 = vdup_n_s16(x[xi]);
         acc = vmlal_s16(acc, vget_low_s16(yy), xj0);
 
-        let xj1 = vld1_dup_s16(xi.add(1));
+        let xj1 = vdup_n_s16(x[xi + 1]);
         let ye1 = vextq_s16(yy, yy1, 1);
         acc = vmlal_s16(acc, vget_low_s16(ye1), xj1);
 
-        let xj2 = vld1_dup_s16(xi.add(2));
+        let xj2 = vdup_n_s16(x[xi + 2]);
         let ye2 = vextq_s16(yy, yy1, 2);
         acc = vmlal_s16(acc, vget_low_s16(ye2), xj2);
 
-        let xj3 = vld1_dup_s16(xi.add(3));
+        let xj3 = vdup_n_s16(x[xi + 3]);
         let ye3 = vextq_s16(yy, yy1, 3);
         acc = vmlal_s16(acc, vget_low_s16(ye3), xj3);
 
-        xi = xi.add(4);
+        xi += 4;
         yy = yy1;
         len -= 4;
     }
 
-    vst1q_s32(sum.as_mut_ptr(), acc);
+    st4_s32(sum, 0, acc);
 
     for k in 0..len {
-        let xv = *xi.add(k) as i32;
+        let xv = x[xi + k] as i32;
 
-        sum[0] = sum[0].wrapping_add(xv * (*yi.add(k) as i32));
-        sum[1] = sum[1].wrapping_add(xv * (*yi.add(k + 1) as i32));
-        sum[2] = sum[2].wrapping_add(xv * (*yi.add(k + 2) as i32));
-        sum[3] = sum[3].wrapping_add(xv * (*yi.add(k + 3) as i32));
+        sum[0] = sum[0].wrapping_add(xv * (y[yi + k] as i32));
+        sum[1] = sum[1].wrapping_add(xv * (y[yi + k + 1] as i32));
+        sum[2] = sum[2].wrapping_add(xv * (y[yi + k + 2] as i32));
+        sum[3] = sum[3].wrapping_add(xv * (y[yi + k + 3] as i32));
     }
 }
 
@@ -404,10 +406,12 @@ pub fn silk_sum_sqr_shift(energy: &mut i32, shift: &mut i32, x: &[i16], len: usi
 
     #[cfg(target_arch = "aarch64")]
     {
+        // SAFETY: NEON is part of the aarch64 baseline.
         nrg = unsafe { silk_sum_sqr_shift_neon(x, len, shft) };
     }
     #[cfg(target_arch = "x86_64")]
     if crate::compat::x86_has_avx2() {
+        // SAFETY: the CPU supports AVX2, checked just above.
         nrg = unsafe { silk_sum_sqr_shift_avx2(x, len, shft) };
     } else {
         nrg = sum_sqr_pairs_shifted(x, len, 0, shft);
@@ -454,16 +458,17 @@ fn sum_sqr_pairs_shifted(x: &[i16], len: usize, init: i32, shft: i32) -> i32 {
 }
 
 #[cfg(target_arch = "aarch64")]
-#[inline(always)]
-#[allow(unsafe_op_in_unsafe_fn)]
-unsafe fn silk_sum_sqr_shift_neon(x: &[i16], len: usize, shft: i32) -> i32 {
+#[inline]
+#[target_feature(enable = "neon")]
+fn silk_sum_sqr_shift_neon(x: &[i16], len: usize, shft: i32) -> i32 {
+    use crate::simd::neon::ld8_s16;
     use core::arch::aarch64::*;
 
     let mut acc = vdupq_n_s64(0i64);
     let mut i = 0;
 
     while i + 8 <= len {
-        let v = vld1q_s16(x.as_ptr().add(i));
+        let v = ld8_s16(x, i);
 
         let lo = vget_low_s16(v);
         let hi = vget_high_s16(v);
@@ -507,11 +512,13 @@ pub fn silk_inner_prod_aligned_scale(
 #[inline(always)]
 pub fn silk_inner_prod_aligned(ptr1: &[i16], ptr2: &[i16], len: usize) -> i32 {
     #[cfg(target_arch = "aarch64")]
+    // SAFETY: NEON is part of the aarch64 baseline.
     unsafe {
         silk_inner_prod_aligned_neon(ptr1, ptr2, len)
     }
     #[cfg(target_arch = "x86_64")]
     if crate::compat::x86_has_avx2() {
+        // SAFETY: the CPU supports AVX2, checked just above.
         return unsafe { silk_inner_prod_aligned_avx2(ptr1, ptr2, len) };
     }
     #[cfg(not(target_arch = "aarch64"))]
@@ -549,9 +556,10 @@ fn silk_inner_prod_aligned_scalar(ptr1: &[i16], ptr2: &[i16], len: usize) -> i32
 }
 
 #[cfg(target_arch = "aarch64")]
-#[inline(always)]
-#[allow(unsafe_op_in_unsafe_fn)]
-unsafe fn silk_inner_prod_aligned_neon(ptr1: &[i16], ptr2: &[i16], len: usize) -> i32 {
+#[inline]
+#[target_feature(enable = "neon")]
+fn silk_inner_prod_aligned_neon(ptr1: &[i16], ptr2: &[i16], len: usize) -> i32 {
+    use crate::simd::neon::ld8_s16;
     use core::arch::aarch64::*;
 
     let mut acc0 = vdupq_n_s32(0i32);
@@ -562,14 +570,14 @@ unsafe fn silk_inner_prod_aligned_neon(ptr1: &[i16], ptr2: &[i16], len: usize) -
     let mut i = 0;
 
     while i + 32 <= len {
-        let a0 = vld1q_s16(ptr1.as_ptr().add(i));
-        let b0 = vld1q_s16(ptr2.as_ptr().add(i));
-        let a1 = vld1q_s16(ptr1.as_ptr().add(i + 8));
-        let b1 = vld1q_s16(ptr2.as_ptr().add(i + 8));
-        let a2 = vld1q_s16(ptr1.as_ptr().add(i + 16));
-        let b2 = vld1q_s16(ptr2.as_ptr().add(i + 16));
-        let a3 = vld1q_s16(ptr1.as_ptr().add(i + 24));
-        let b3 = vld1q_s16(ptr2.as_ptr().add(i + 24));
+        let a0 = ld8_s16(ptr1, i);
+        let b0 = ld8_s16(ptr2, i);
+        let a1 = ld8_s16(ptr1, i + 8);
+        let b1 = ld8_s16(ptr2, i + 8);
+        let a2 = ld8_s16(ptr1, i + 16);
+        let b2 = ld8_s16(ptr2, i + 16);
+        let a3 = ld8_s16(ptr1, i + 24);
+        let b3 = ld8_s16(ptr2, i + 24);
 
         acc0 = vmlal_s16(acc0, vget_low_s16(a0), vget_low_s16(b0));
         acc0 = vmlal_high_s16(acc0, a0, b0);
@@ -584,8 +592,8 @@ unsafe fn silk_inner_prod_aligned_neon(ptr1: &[i16], ptr2: &[i16], len: usize) -
     }
 
     while i + 8 <= len {
-        let a0 = vld1q_s16(ptr1.as_ptr().add(i));
-        let b0 = vld1q_s16(ptr2.as_ptr().add(i));
+        let a0 = ld8_s16(ptr1, i);
+        let b0 = ld8_s16(ptr2, i);
         acc0 = vmlal_s16(acc0, vget_low_s16(a0), vget_low_s16(b0));
         acc0 = vmlal_high_s16(acc0, a0, b0);
         i += 8;
@@ -931,9 +939,8 @@ pub fn silk_lpc_analysis_filter(
 
     #[cfg(target_arch = "x86_64")]
     if d <= 16 && crate::compat::x86_has_avx2() {
-        unsafe {
-            silk_lpc_analysis_filter_avx2(out, input, b, len, d);
-        }
+        // SAFETY: the CPU supports AVX2, checked just above.
+        unsafe { silk_lpc_analysis_filter_avx2(out, input, b, len, d) };
         return;
     }
 
@@ -963,56 +970,34 @@ fn silk_lpc_analysis_filter_scalar(
     len: usize,
     d: usize,
 ) {
+    let out = &mut out[..len];
+    let input = &input[..len];
+    let b = &b[..d];
     for out_val in out[..d].iter_mut() {
         *out_val = 0;
     }
 
-    unsafe {
-        for ix in d..len {
-            let mut out32_q12: i32;
-            out32_q12 = silk_smulbb(
-                *input.get_unchecked(ix - 1) as i32,
-                *b.get_unchecked(0) as i32,
-            );
-            out32_q12 = out32_q12.wrapping_add(silk_smulbb(
-                *input.get_unchecked(ix - 2) as i32,
-                *b.get_unchecked(1) as i32,
-            ));
-            out32_q12 = out32_q12.wrapping_add(silk_smulbb(
-                *input.get_unchecked(ix - 3) as i32,
-                *b.get_unchecked(2) as i32,
-            ));
-            out32_q12 = out32_q12.wrapping_add(silk_smulbb(
-                *input.get_unchecked(ix - 4) as i32,
-                *b.get_unchecked(3) as i32,
-            ));
-            out32_q12 = out32_q12.wrapping_add(silk_smulbb(
-                *input.get_unchecked(ix - 5) as i32,
-                *b.get_unchecked(4) as i32,
-            ));
-            out32_q12 = out32_q12.wrapping_add(silk_smulbb(
-                *input.get_unchecked(ix - 6) as i32,
-                *b.get_unchecked(5) as i32,
-            ));
-            let mut j = 6;
-            while j < d {
-                out32_q12 = out32_q12.wrapping_add(silk_smulbb(
-                    *input.get_unchecked(ix - j - 1) as i32,
-                    *b.get_unchecked(j) as i32,
-                ));
-                out32_q12 = out32_q12.wrapping_add(silk_smulbb(
-                    *input.get_unchecked(ix - j - 2) as i32,
-                    *b.get_unchecked(j + 1) as i32,
-                ));
-                j += 2;
-            }
-
-            out32_q12 = ((*input.get_unchecked(ix) as i32) << 12).wrapping_sub(out32_q12);
-
-            let out32 = silk_rshift_round(out32_q12, 12);
-
-            *out.get_unchecked_mut(ix) = silk_sat16(out32) as i16;
+    for ix in d..len {
+        let mut out32_q12: i32;
+        out32_q12 = silk_smulbb(input[ix - 1] as i32, b[0] as i32);
+        out32_q12 = out32_q12.wrapping_add(silk_smulbb(input[ix - 2] as i32, b[1] as i32));
+        out32_q12 = out32_q12.wrapping_add(silk_smulbb(input[ix - 3] as i32, b[2] as i32));
+        out32_q12 = out32_q12.wrapping_add(silk_smulbb(input[ix - 4] as i32, b[3] as i32));
+        out32_q12 = out32_q12.wrapping_add(silk_smulbb(input[ix - 5] as i32, b[4] as i32));
+        out32_q12 = out32_q12.wrapping_add(silk_smulbb(input[ix - 6] as i32, b[5] as i32));
+        let mut j = 6;
+        while j < d {
+            out32_q12 = out32_q12.wrapping_add(silk_smulbb(input[ix - j - 1] as i32, b[j] as i32));
+            out32_q12 =
+                out32_q12.wrapping_add(silk_smulbb(input[ix - j - 2] as i32, b[j + 1] as i32));
+            j += 2;
         }
+
+        out32_q12 = ((input[ix] as i32) << 12).wrapping_sub(out32_q12);
+
+        let out32 = silk_rshift_round(out32_q12, 12);
+
+        out[ix] = silk_sat16(out32) as i16;
     }
 }
 
@@ -1071,164 +1056,73 @@ pub fn silk_shr32(a: i32, shift: i32) -> i32 {
 }
 
 #[cfg(target_arch = "x86_64")]
-use core::arch::x86_64::*;
-
-#[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 #[inline]
-unsafe fn silk_inner_prod_aligned_avx2(ptr1: &[i16], ptr2: &[i16], len: usize) -> i32 {
-    let mut acc0 = _mm256_setzero_si256();
-    let mut acc1 = _mm256_setzero_si256();
-    let mut i = 0;
-
-    while i + 32 <= len {
-        let a0 = _mm256_loadu_si256(ptr1.as_ptr().add(i) as *const __m256i);
-        let b0 = _mm256_loadu_si256(ptr2.as_ptr().add(i) as *const __m256i);
-        let a1 = _mm256_loadu_si256(ptr1.as_ptr().add(i + 16) as *const __m256i);
-        let b1 = _mm256_loadu_si256(ptr2.as_ptr().add(i + 16) as *const __m256i);
-
-        acc0 = _mm256_add_epi32(acc0, _mm256_madd_epi16(a0, b0));
-        acc1 = _mm256_add_epi32(acc1, _mm256_madd_epi16(a1, b1));
-        i += 32;
-    }
-    while i + 16 <= len {
-        let a = _mm256_loadu_si256(ptr1.as_ptr().add(i) as *const __m256i);
-        let b = _mm256_loadu_si256(ptr2.as_ptr().add(i) as *const __m256i);
-        acc0 = _mm256_add_epi32(acc0, _mm256_madd_epi16(a, b));
-        i += 16;
-    }
-
-    let acc = _mm256_add_epi32(acc0, acc1);
-    let hi = _mm256_extracti128_si256(acc, 1);
-    let lo = _mm256_castsi256_si128(acc);
-    let sum4 = _mm_add_epi32(lo, hi);
-    let sum2 = _mm_add_epi32(sum4, _mm_srli_si128(sum4, 8));
-    let sum1 = _mm_add_epi32(sum2, _mm_srli_si128(sum2, 4));
-    let mut result = _mm_cvtsi128_si32(sum1);
-
-    if i + 8 <= len {
-        let a = _mm_loadu_si128(ptr1.as_ptr().add(i) as *const __m128i);
-        let b = _mm_loadu_si128(ptr2.as_ptr().add(i) as *const __m128i);
-        let p = _mm_madd_epi16(a, b);
-        let p2 = _mm_add_epi32(p, _mm_srli_si128(p, 8));
-        let p1 = _mm_add_epi32(p2, _mm_srli_si128(p2, 4));
-        result = result.wrapping_add(_mm_cvtsi128_si32(p1));
-        i += 8;
-    }
-
-    while i < len {
-        result = result.wrapping_add((ptr1[i] as i32).wrapping_mul(ptr2[i] as i32));
-        i += 1;
-    }
-
-    result
+fn silk_inner_prod_aligned_avx2(ptr1: &[i16], ptr2: &[i16], len: usize) -> i32 {
+    // Wrapping integer sums give the same result in any order, so this plain
+    // loop, vectorized by the compiler, matches the old madd-based kernel.
+    ptr1[..len]
+        .iter()
+        .zip(&ptr2[..len])
+        .fold(0i32, |s, (&a, &b)| s.wrapping_add(a as i32 * b as i32))
 }
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 #[inline]
-unsafe fn xcorr_kernel_avx2(x: &[i16], y: &[i16], sum: &mut [i32; 4], len: usize) {
-    debug_assert!(x.len() >= len);
-    debug_assert!(y.len() >= len + 3);
-
-    let mut acc = _mm_setzero_si128();
-    let mut i = 0;
-
-    while i + 4 <= len {
-        let x4 = _mm_loadl_epi64(x.as_ptr().add(i) as *const __m128i);
-        let xdup = _mm_unpacklo_epi64(x4, x4);
-
-        let y8 = _mm_loadu_si128(y.as_ptr().add(i) as *const __m128i);
-        let y1 = _mm_bsrli_si128(y8, 2);
-        let y2 = _mm_bsrli_si128(y8, 4);
-        let y3 = _mm_bsrli_si128(y8, 6);
-
-        let y4_01 = _mm_unpacklo_epi64(y8, y1);
-
-        let y4_23 = _mm_unpacklo_epi64(y2, y3);
-
-        let p01 = _mm_madd_epi16(xdup, y4_01);
-        let p23 = _mm_madd_epi16(xdup, y4_23);
-
-        acc = _mm_add_epi32(acc, _mm_hadd_epi32(p01, p23));
-
-        i += 4;
-    }
-
-    let mut tmp = [0i32; 4];
-    _mm_storeu_si128(tmp.as_mut_ptr() as *mut __m128i, acc);
-    sum[0] = sum[0].wrapping_add(tmp[0]);
-    sum[1] = sum[1].wrapping_add(tmp[1]);
-    sum[2] = sum[2].wrapping_add(tmp[2]);
-    sum[3] = sum[3].wrapping_add(tmp[3]);
-
-    let mut y_0 = y[i];
-    let mut y_1 = y[i + 1];
-    let mut y_2 = y[i + 2];
-    for j in i..len {
-        let y_3 = y[j + 3];
-        let xv = x[j] as i32;
-        sum[0] = sum[0].wrapping_add(xv.wrapping_mul(y_0 as i32));
-        sum[1] = sum[1].wrapping_add(xv.wrapping_mul(y_1 as i32));
-        sum[2] = sum[2].wrapping_add(xv.wrapping_mul(y_2 as i32));
-        sum[3] = sum[3].wrapping_add(xv.wrapping_mul(y_3 as i32));
-        y_0 = y_1;
-        y_1 = y_2;
-        y_2 = y_3;
+fn xcorr_kernel_avx2(x: &[i16], y: &[i16], sum: &mut [i32; 4], len: usize) {
+    // sum[k] += x[j] * y[j + k]; wrapping integer sums are order-free, so
+    // the compiler may vectorize this any way it likes.
+    let x = &x[..len];
+    let y = &y[..len + 3];
+    for (k, s) in sum.iter_mut().enumerate() {
+        let yk = &y[k..k + len];
+        let dot = x
+            .iter()
+            .zip(yk)
+            .fold(0i32, |acc, (&a, &b)| acc.wrapping_add(a as i32 * b as i32));
+        *s = s.wrapping_add(dot);
     }
 }
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 #[inline]
-unsafe fn silk_sum_sqr_shift_avx2(x: &[i16], len: usize, shft: i32) -> i32 {
-    let mut acc = _mm256_setzero_si256();
-    let mut i = 0;
-
-    while i + 16 <= len {
-        let v = _mm256_loadu_si256(x.as_ptr().add(i) as *const __m256i);
-
-        let sq = _mm256_madd_epi16(v, v);
-
-        let vshift = _mm256_set1_epi32(shft);
-        let shifted = if shft > 0 {
-            _mm256_srlv_epi32(sq, vshift)
-        } else {
-            sq
-        };
-        acc = _mm256_add_epi32(acc, shifted);
-        i += 16;
+fn silk_sum_sqr_shift_avx2(x: &[i16], len: usize, shft: i32) -> i32 {
+    // Blocks of sixteen are summed as shifted pairs `(a^2 + b^2) >> shft`
+    // and the rest element by element, as the old AVX2 kernel did; the
+    // integer sums themselves are order-free.
+    let x = &x[..len];
+    let (blocks, rest) = x.as_chunks::<16>();
+    let mut nrg = 0i32;
+    for blk in blocks {
+        for p in blk.as_chunks::<2>().0 {
+            let sq = (p[0] as i32 * p[0] as i32).wrapping_add(p[1] as i32 * p[1] as i32) as u32;
+            // A logical shift; `_mm256_srlv_epi32` gave 0 for counts >= 32.
+            let shifted = if shft > 0 {
+                sq.checked_shr(shft as u32).unwrap_or(0)
+            } else {
+                sq
+            };
+            nrg = nrg.wrapping_add(shifted as i32);
+        }
     }
-
-    let hi = _mm256_extracti128_si256(acc, 1);
-    let lo = _mm256_castsi256_si128(acc);
-    let sum4 = _mm_add_epi32(lo, hi);
-    let sum2 = _mm_add_epi32(sum4, _mm_srli_si128(sum4, 8));
-    let sum1 = _mm_add_epi32(sum2, _mm_srli_si128(sum2, 4));
-    let mut nrg = _mm_cvtsi128_si32(sum1);
-
-    while i < len {
-        let v = x[i] as i32;
+    for &v in rest {
+        let v = v as i32;
         let sq = (v * v) as u32;
         nrg = nrg.wrapping_add((sq >> shft) as i32);
-        i += 1;
     }
-
     nrg
 }
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 #[inline]
-unsafe fn silk_lpc_analysis_filter_avx2(
-    out: &mut [i16],
-    input: &[i16],
-    b: &[i16],
-    len: usize,
-    d: usize,
-) {
+fn silk_lpc_analysis_filter_avx2(out: &mut [i16], input: &[i16], b: &[i16], len: usize, d: usize) {
     debug_assert!(d >= 6 && (d & 1) == 0 && d <= 16);
 
+    // Coefficients reversed and zero-padded to a fixed sixteen taps, so each
+    // output is one fixed-length dot product the compiler vectorizes.
     let mut b_rev_pad = [0i16; 16];
     for k in 0..d {
         b_rev_pad[15 - k] = b[k];
@@ -1248,50 +1142,33 @@ unsafe fn silk_lpc_analysis_filter_avx2(
         out[ix] = silk_sat16(silk_rshift_round(out32_q12, 12)) as i16;
     }
 
-    if avx_start >= len {
-        return;
-    }
-
-    let b_lo = _mm256_cvtepi16_epi32(_mm_loadu_si128(b_rev_pad.as_ptr() as *const __m128i));
-    let b_hi = _mm256_cvtepi16_epi32(_mm_loadu_si128(b_rev_pad.as_ptr().add(8) as *const __m128i));
-
     for ix in avx_start..len {
-        let base = input.as_ptr().add(ix - 16);
-        let inp_lo = _mm256_cvtepi16_epi32(_mm_loadu_si128(base as *const __m128i));
-        let inp_hi = _mm256_cvtepi16_epi32(_mm_loadu_si128(base.add(8) as *const __m128i));
-
-        let prod_lo = _mm256_mullo_epi32(inp_lo, b_lo);
-        let prod_hi = _mm256_mullo_epi32(inp_hi, b_hi);
-
-        let sum256 = _mm256_add_epi32(prod_lo, prod_hi);
-        let hi128 = _mm256_extracti128_si256(sum256, 1);
-        let lo128 = _mm256_castsi256_si128(sum256);
-        let sum128 = _mm_add_epi32(lo128, hi128);
-        let sum64 = _mm_add_epi32(sum128, _mm_srli_si128(sum128, 8));
-        let sum32 = _mm_add_epi32(sum64, _mm_srli_si128(sum64, 4));
-        let s = _mm_cvtsi128_si32(sum32);
-
+        let s = input[ix - 16..ix]
+            .iter()
+            .zip(&b_rev_pad)
+            .fold(0i32, |acc, (&a, &c)| acc.wrapping_add(a as i32 * c as i32));
         let out32_q12 = ((input[ix] as i32) << 12).wrapping_sub(s);
         out[ix] = silk_sat16(silk_rshift_round(out32_q12, 12)) as i16;
     }
 }
 
 #[cfg(target_arch = "aarch64")]
-#[inline(always)]
-#[allow(unsafe_op_in_unsafe_fn)]
-unsafe fn silk_biquad_alt_stride2_neon(
+#[inline]
+#[target_feature(enable = "neon")]
+fn silk_biquad_alt_stride2_neon(
     input_output: &mut [i16],
     b_q28: &[i32],
     a_q28: &[i32],
     s: &mut [i32],
     len: usize,
 ) {
+    use crate::simd::neon::{ld2_s32, ld4_s16, ld4_s32, st4_s16};
     use core::arch::aarch64::*;
 
     let offset_s32x2 = vdup_n_s32((1 << 14) - 1);
     let offset_s32x4 = vcombine_s32(offset_s32x2, offset_s32x2);
 
-    let a_q28_s32x2 = vneg_s32(vld1_s32(a_q28.as_ptr()));
+    let a_q28_s32x2 = vneg_s32(ld2_s32(a_q28, 0));
     let a_l_s32x2 = vreinterpret_s32_u32(vshr_n_u32(
         vreinterpret_u32_s32(vshl_n_s32(a_q28_s32x2, 18)),
         3,
@@ -1299,8 +1176,8 @@ unsafe fn silk_biquad_alt_stride2_neon(
     let mut a_u_s32x2 = vshr_n_s32(a_q28_s32x2, 14);
     a_u_s32x2 = vshr_n_s32(vshl_n_s32(a_u_s32x2, 16), 1);
 
-    let b_q28_s32x2 = vld1_s32(b_q28.as_ptr());
-    let t_s32x2 = vld1_s32(b_q28.as_ptr().add(1));
+    let b_q28_s32x2 = ld2_s32(b_q28, 0);
+    let t_s32x2 = ld2_s32(b_q28, 1);
 
     let t0_s32x2x2 = vzip_s32(a_l_s32x2, a_l_s32x2);
     let t1_s32x2x2 = vzip_s32(a_u_s32x2, a_u_s32x2);
@@ -1310,13 +1187,13 @@ unsafe fn silk_biquad_alt_stride2_neon(
     let a_u_s32x4 = vcombine_s32(t1_s32x2x2.0, t1_s32x2x2.1);
     let b_q28_s32x4 = vcombine_s32(t2_s32x2x2.0, t2_s32x2x2.1);
 
-    let mut s_s32x4 = vld1q_s32(s.as_ptr());
+    let mut s_s32x4 = ld4_s32(s, 0);
     let s_s32x2x2 = vtrn_s32(vget_low_s32(s_s32x4), vget_high_s32(s_s32x4));
     s_s32x4 = vcombine_s32(s_s32x2x2.0, s_s32x2x2.1);
 
     let mut k = 0;
     while k + 1 < len {
-        let in_s16x4 = vld1_s16(input_output.as_ptr().add(2 * k));
+        let in_s16x4 = ld4_s16(input_output, 2 * k);
         let in_s32x4 = vshll_n_s16(in_s16x4, 15);
 
         let t_s32x4 = vqdmulhq_lane_s32(in_s32x4, b_q28_s32x2, 0);
@@ -1363,7 +1240,7 @@ unsafe fn silk_biquad_alt_stride2_neon(
         let out_s32x4 = vaddq_s32(out32_q14_combined, offset_s32x4);
         let out_s16x4 = vqshrn_n_s32(out_s32x4, 14);
 
-        vst1_s16(input_output.as_mut_ptr().add(2 * k), out_s16x4);
+        st4_s16(input_output, 2 * k, out_s16x4);
 
         k += 2;
     }
@@ -1405,10 +1282,10 @@ unsafe fn silk_biquad_alt_stride2_neon(
         s[2] = s2_new;
         s[3] = s3_new;
     } else {
-        vst1q_lane_s32(&mut s[0], s_s32x4, 0);
-        vst1q_lane_s32(&mut s[1], s_s32x4, 2);
-        vst1q_lane_s32(&mut s[2], s_s32x4, 1);
-        vst1q_lane_s32(&mut s[3], s_s32x4, 3);
+        s[0] = vgetq_lane_s32(s_s32x4, 0);
+        s[1] = vgetq_lane_s32(s_s32x4, 2);
+        s[2] = vgetq_lane_s32(s_s32x4, 1);
+        s[3] = vgetq_lane_s32(s_s32x4, 3);
     }
 }
 

@@ -163,4 +163,40 @@ pub(crate) mod neon {
         // SAFETY: `d` is 4 writable i32s.
         unsafe { vst1q_s32(d.as_mut_ptr(), v) }
     }
+
+    /// Loads `s[i..i + 2]` as two i32 lanes.
+    #[inline]
+    #[target_feature(enable = "neon")]
+    pub(crate) fn ld2_s32(s: &[i32], i: usize) -> int32x2_t {
+        let v = &s[i..i + 2];
+        // SAFETY: `v` is 2 readable i32s.
+        unsafe { vld1_s32(v.as_ptr()) }
+    }
+
+    /// Loads `s[i..i + 8]` as eight i16 lanes.
+    #[inline]
+    #[target_feature(enable = "neon")]
+    pub(crate) fn ld8_s16(s: &[i16], i: usize) -> int16x8_t {
+        let v = &s[i..i + 8];
+        // SAFETY: `v` is 8 readable i16s.
+        unsafe { vld1q_s16(v.as_ptr()) }
+    }
+
+    /// Loads `s[i..i + 4]` as four i16 lanes.
+    #[inline]
+    #[target_feature(enable = "neon")]
+    pub(crate) fn ld4_s16(s: &[i16], i: usize) -> int16x4_t {
+        let v = &s[i..i + 4];
+        // SAFETY: `v` is 4 readable i16s.
+        unsafe { vld1_s16(v.as_ptr()) }
+    }
+
+    /// Stores four i16 lanes to `s[i..i + 4]`.
+    #[inline]
+    #[target_feature(enable = "neon")]
+    pub(crate) fn st4_s16(s: &mut [i16], i: usize, v: int16x4_t) {
+        let d = &mut s[i..i + 4];
+        // SAFETY: `d` is 4 writable i16s.
+        unsafe { vst1_s16(d.as_mut_ptr(), v) }
+    }
 }
