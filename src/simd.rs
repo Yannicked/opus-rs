@@ -93,6 +93,15 @@ pub(crate) mod neon {
         unsafe { vst1q_f32(d.as_mut_ptr(), v) }
     }
 
+    /// Loads `s[i..i + 2]`.
+    #[inline]
+    #[target_feature(enable = "neon")]
+    pub(crate) fn ld2(s: &[f32], i: usize) -> float32x2_t {
+        let v = &s[i..i + 2];
+        // SAFETY: `v` is 2 readable f32s.
+        unsafe { vld1_f32(v.as_ptr()) }
+    }
+
     /// Loads `s[i..i + 8]` de-interleaved: even elements in `.0`, odd in `.1`.
     #[inline]
     #[target_feature(enable = "neon")]

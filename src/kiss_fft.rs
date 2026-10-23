@@ -21,6 +21,25 @@ impl KissCpx {
     pub const fn new(r: f32, i: f32) -> Self {
         Self { r, i }
     }
+
+    /// Views complex values as the interleaved `[r0, i0, r1, i1, ..]` floats
+    /// they are made of, so SIMD kernels can load them with the slice-checked
+    /// helpers in `simd.rs`.
+    #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+    #[inline(always)]
+    pub(crate) fn as_floats(s: &[KissCpx]) -> &[f32] {
+        // SAFETY: `KissCpx` is `#[repr(C)]` with exactly two `f32` fields and
+        // no padding, so `n` of them are `2n` properly aligned `f32`s.
+        unsafe { core::slice::from_raw_parts(s.as_ptr().cast::<f32>(), 2 * s.len()) }
+    }
+
+    /// Mutable form of [`KissCpx::as_floats`].
+    #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+    #[inline(always)]
+    pub(crate) fn as_floats_mut(s: &mut [KissCpx]) -> &mut [f32] {
+        // SAFETY: as in `as_floats`; the exclusive borrow of `s` carries over.
+        unsafe { core::slice::from_raw_parts_mut(s.as_mut_ptr().cast::<f32>(), 2 * s.len()) }
+    }
 }
 
 #[inline(always)]
@@ -215,20 +234,22 @@ impl KissFftState {
 }
 
 #[cfg(target_arch = "aarch64")]
-#[inline(always)]
-unsafe fn kf_bfly2_m1_neon(fout: &mut [KissCpx], n: usize) {
+#[inline]
+#[target_feature(enable = "neon")]
+fn kf_bfly2_m1_neon(fout: &mut [KissCpx], n: usize) {
+    use crate::simd::neon::{ld4, st4};
     use core::arch::aarch64::*;
 
-    let ptr = fout.as_mut_ptr() as *mut f32;
+    let ff = KissCpx::as_floats_mut(fout);
 
     let mut i = 0usize;
 
     while i + 4 <= n {
         let base = i * 4;
-        let v0 = vld1q_f32(ptr.add(base));
-        let v1 = vld1q_f32(ptr.add(base + 4));
-        let v2 = vld1q_f32(ptr.add(base + 8));
-        let v3 = vld1q_f32(ptr.add(base + 12));
+        let v0 = ld4(ff, base);
+        let v1 = ld4(ff, base + 4);
+        let v2 = ld4(ff, base + 8);
+        let v3 = ld4(ff, base + 12);
 
         let r0 = vcombine_f32(
             vadd_f32(vget_low_f32(v0), vget_high_f32(v0)),
@@ -247,18 +268,18 @@ unsafe fn kf_bfly2_m1_neon(fout: &mut [KissCpx], n: usize) {
             vsub_f32(vget_low_f32(v3), vget_high_f32(v3)),
         );
 
-        vst1q_f32(ptr.add(base), r0);
-        vst1q_f32(ptr.add(base + 4), r1);
-        vst1q_f32(ptr.add(base + 8), r2);
-        vst1q_f32(ptr.add(base + 12), r3);
+        st4(ff, base, r0);
+        st4(ff, base + 4, r1);
+        st4(ff, base + 8, r2);
+        st4(ff, base + 12, r3);
 
         i += 4;
     }
 
     while i + 2 <= n {
         let base = i * 4;
-        let v0 = vld1q_f32(ptr.add(base));
-        let v1 = vld1q_f32(ptr.add(base + 4));
+        let v0 = ld4(ff, base);
+        let v1 = ld4(ff, base + 4);
         let r0 = vcombine_f32(
             vadd_f32(vget_low_f32(v0), vget_high_f32(v0)),
             vsub_f32(vget_low_f32(v0), vget_high_f32(v0)),
@@ -267,8 +288,8 @@ unsafe fn kf_bfly2_m1_neon(fout: &mut [KissCpx], n: usize) {
             vadd_f32(vget_low_f32(v1), vget_high_f32(v1)),
             vsub_f32(vget_low_f32(v1), vget_high_f32(v1)),
         );
-        vst1q_f32(ptr.add(base), r0);
-        vst1q_f32(ptr.add(base + 4), r1);
+        st4(ff, base, r0);
+        st4(ff, base + 4, r1);
         i += 2;
     }
 
@@ -285,16 +306,16 @@ unsafe fn kf_bfly2_m1_neon(fout: &mut [KissCpx], n: usize) {
 fn kf_bfly2(fout: &mut [KissCpx], m: usize, n: usize) {
     if m == 1 {
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-        unsafe {
-            if crate::compat::x86_has_avx() {
-                kf_bfly2_m1_avx(fout, n);
-                return;
-            }
+        if crate::compat::x86_has_avx() {
+            // SAFETY: the CPU supports AVX, checked just above.
+            unsafe { kf_bfly2_m1_avx(fout, n) };
+            return;
         }
         #[cfg(target_arch = "aarch64")]
+        // SAFETY: NEON is part of the aarch64 baseline.
         unsafe {
-            kf_bfly2_m1_neon(fout, n);
-        }
+            kf_bfly2_m1_neon(fout, n)
+        };
         #[cfg(not(target_arch = "aarch64"))]
         for i in 0..n {
             let idx = i * 2;
@@ -333,22 +354,24 @@ fn kf_bfly2(fout: &mut [KissCpx], m: usize, n: usize) {
 }
 
 #[cfg(target_arch = "aarch64")]
-#[inline(always)]
-unsafe fn kf_bfly4_m1_neon(fout: &mut [KissCpx], n: usize) {
+#[inline]
+#[target_feature(enable = "neon")]
+fn kf_bfly4_m1_neon(fout: &mut [KissCpx], n: usize) {
+    use crate::simd::neon::{ld4, st4};
     use core::arch::aarch64::*;
 
-    let ptr = fout.as_mut_ptr() as *mut f32;
+    let ff = KissCpx::as_floats_mut(fout);
 
     let mut i = 0usize;
 
     while i + 2 <= n {
         let base = i * 8;
 
-        let v0 = vld1q_f32(ptr.add(base));
-        let v1 = vld1q_f32(ptr.add(base + 4));
+        let v0 = ld4(ff, base);
+        let v1 = ld4(ff, base + 4);
 
-        let v2 = vld1q_f32(ptr.add(base + 8));
-        let v3 = vld1q_f32(ptr.add(base + 12));
+        let v2 = ld4(ff, base + 8);
+        let v3 = ld4(ff, base + 12);
 
         let sum02_0 = vadd_f32(vget_low_f32(v0), vget_low_f32(v1));
         let diff02_0 = vsub_f32(vget_low_f32(v0), vget_low_f32(v1));
@@ -365,8 +388,8 @@ unsafe fn kf_bfly4_m1_neon(fout: &mut [KissCpx], n: usize) {
         let f1_0 = vadd_f32(diff02_0, mj_d13_0);
         let f3_0 = vadd_f32(diff02_0, j_d13_0);
 
-        vst1q_f32(ptr.add(base), vcombine_f32(f0_0, f1_0));
-        vst1q_f32(ptr.add(base + 4), vcombine_f32(f2_0, f3_0));
+        st4(ff, base, vcombine_f32(f0_0, f1_0));
+        st4(ff, base + 4, vcombine_f32(f2_0, f3_0));
 
         let sum02_1 = vadd_f32(vget_low_f32(v2), vget_low_f32(v3));
         let diff02_1 = vsub_f32(vget_low_f32(v2), vget_low_f32(v3));
@@ -381,8 +404,8 @@ unsafe fn kf_bfly4_m1_neon(fout: &mut [KissCpx], n: usize) {
         let f1_1 = vadd_f32(diff02_1, mj_d13_1);
         let f3_1 = vadd_f32(diff02_1, j_d13_1);
 
-        vst1q_f32(ptr.add(base + 8), vcombine_f32(f0_1, f1_1));
-        vst1q_f32(ptr.add(base + 12), vcombine_f32(f2_1, f3_1));
+        st4(ff, base + 8, vcombine_f32(f0_1, f1_1));
+        st4(ff, base + 12, vcombine_f32(f2_1, f3_1));
 
         i += 2;
     }
@@ -403,7 +426,7 @@ unsafe fn kf_bfly4_m1_neon(fout: &mut [KissCpx], n: usize) {
 
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
-unsafe fn kf_bfly4_neon_inner(
+fn kf_bfly4_neon_inner(
     fout: &mut [KissCpx],
     twiddles: &[KissCpx],
     m: usize,
@@ -487,16 +510,16 @@ fn kf_bfly4(
 ) {
     if m == 1 {
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-        unsafe {
-            if crate::compat::x86_has_avx() {
-                kf_bfly4_m1_avx(fout, n);
-                return;
-            }
+        if crate::compat::x86_has_avx() {
+            // SAFETY: the CPU supports AVX, checked just above.
+            unsafe { kf_bfly4_m1_avx(fout, n) };
+            return;
         }
         #[cfg(target_arch = "aarch64")]
+        // SAFETY: NEON is part of the aarch64 baseline.
         unsafe {
-            kf_bfly4_m1_neon(fout, n);
-        }
+            kf_bfly4_m1_neon(fout, n)
+        };
         #[cfg(not(target_arch = "aarch64"))]
         for i in 0..n {
             let base = i * 4;
@@ -513,16 +536,13 @@ fn kf_bfly4(
         }
     } else {
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-        unsafe {
-            if crate::compat::x86_has_avx() {
-                kf_bfly4_avx_inner(fout, twiddles, m, n, mm, fstride);
-                return;
-            }
+        if crate::compat::x86_has_avx() {
+            // SAFETY: the CPU supports AVX, checked just above.
+            unsafe { kf_bfly4_avx_inner(fout, twiddles, m, n, mm, fstride) };
+            return;
         }
         #[cfg(target_arch = "aarch64")]
-        unsafe {
-            kf_bfly4_neon_inner(fout, twiddles, m, n, mm, fstride);
-        }
+        kf_bfly4_neon_inner(fout, twiddles, m, n, mm, fstride);
         #[cfg(not(target_arch = "aarch64"))]
         {
             let stride2 = fstride * 2;
@@ -573,16 +593,16 @@ fn kf_bfly3(
     mm: usize,
 ) {
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    unsafe {
-        if crate::compat::x86_has_avx() {
-            kf_bfly3_avx_inner(fout, fstride, twiddles, m, n, mm);
-            return;
-        }
+    if crate::compat::x86_has_avx() {
+        // SAFETY: the CPU supports AVX, checked just above.
+        unsafe { kf_bfly3_avx_inner(fout, fstride, twiddles, m, n, mm) };
+        return;
     }
     #[cfg(target_arch = "aarch64")]
+    // SAFETY: NEON is part of the aarch64 baseline.
     unsafe {
-        kf_bfly3_neon_inner(fout, fstride, twiddles, m, n, mm);
-    }
+        kf_bfly3_neon_inner(fout, fstride, twiddles, m, n, mm)
+    };
     #[cfg(not(target_arch = "aarch64"))]
     {
         let m2 = 2 * m;
@@ -636,16 +656,16 @@ fn kf_bfly5(
     mm: usize,
 ) {
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    unsafe {
-        if crate::compat::x86_has_avx() {
-            kf_bfly5_avx_inner(fout, fstride, twiddles, m, n, mm);
-            return;
-        }
+    if crate::compat::x86_has_avx() {
+        // SAFETY: the CPU supports AVX, checked just above.
+        unsafe { kf_bfly5_avx_inner(fout, fstride, twiddles, m, n, mm) };
+        return;
     }
     #[cfg(target_arch = "aarch64")]
+    // SAFETY: NEON is part of the aarch64 baseline.
     unsafe {
-        kf_bfly5_neon_inner(fout, fstride, twiddles, m, n, mm);
-    }
+        kf_bfly5_neon_inner(fout, fstride, twiddles, m, n, mm)
+    };
     #[cfg(not(target_arch = "aarch64"))]
     {
         let ya = KissCpx::new(0.309_017, -0.95105652);
@@ -723,7 +743,7 @@ fn kf_bfly5(
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "avx")]
-unsafe fn kf_bfly2_m1_avx(fout: &mut [KissCpx], n: usize) {
+fn kf_bfly2_m1_avx(fout: &mut [KissCpx], n: usize) {
     for i in 0..n {
         let idx = i * 2;
         let t = fout[idx + 1];
@@ -734,7 +754,7 @@ unsafe fn kf_bfly2_m1_avx(fout: &mut [KissCpx], n: usize) {
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "avx")]
-unsafe fn kf_bfly4_m1_avx(fout: &mut [KissCpx], n: usize) {
+fn kf_bfly4_m1_avx(fout: &mut [KissCpx], n: usize) {
     let mut i = 0usize;
     while i < n {
         let base = i * 4;
@@ -753,7 +773,7 @@ unsafe fn kf_bfly4_m1_avx(fout: &mut [KissCpx], n: usize) {
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "avx")]
-unsafe fn kf_bfly4_avx_inner(
+fn kf_bfly4_avx_inner(
     fout: &mut [KissCpx],
     twiddles: &[KissCpx],
     m: usize,
@@ -800,7 +820,7 @@ unsafe fn kf_bfly4_avx_inner(
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "avx")]
-unsafe fn kf_bfly3_avx_inner(
+fn kf_bfly3_avx_inner(
     fout: &mut [KissCpx],
     fstride: usize,
     twiddles: &[KissCpx],
@@ -844,7 +864,7 @@ unsafe fn kf_bfly3_avx_inner(
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "avx")]
-unsafe fn kf_bfly5_avx_inner(
+fn kf_bfly5_avx_inner(
     fout: &mut [KissCpx],
     fstride: usize,
     twiddles: &[KissCpx],
@@ -924,8 +944,9 @@ unsafe fn kf_bfly5_avx_inner(
 }
 
 #[cfg(target_arch = "aarch64")]
-#[inline(always)]
-unsafe fn neon_cmul_2(
+#[inline]
+#[target_feature(enable = "neon")]
+fn neon_cmul_2(
     a: core::arch::aarch64::float32x4_t,
     b: core::arch::aarch64::float32x4_t,
 ) -> core::arch::aarch64::float32x4_t {
@@ -950,8 +971,9 @@ unsafe fn neon_cmul_2(
 }
 
 #[cfg(target_arch = "aarch64")]
-#[inline(always)]
-unsafe fn kf_bfly3_neon_inner(
+#[inline]
+#[target_feature(enable = "neon")]
+fn kf_bfly3_neon_inner(
     fout: &mut [KissCpx],
     fstride: usize,
     twiddles: &[KissCpx],
@@ -959,13 +981,13 @@ unsafe fn kf_bfly3_neon_inner(
     n: usize,
     mm: usize,
 ) {
+    use crate::simd::neon::{ld2, ld4, st4};
     use core::arch::aarch64::*;
 
     let m2 = 2 * m;
     let epi3_i: f32 = -0.866_025_4;
     let stride2 = fstride * 2;
-    let fout_ptr = fout.as_mut_ptr() as *mut f32;
-    let tw_ptr = twiddles.as_ptr() as *const f32;
+    let twf = KissCpx::as_floats(twiddles);
 
     for i in 0..n {
         let base = i * mm;
@@ -977,19 +999,20 @@ unsafe fn kf_bfly3_neon_inner(
 
         while j < m_vec {
             let idx0 = base + j;
+            let ff = KissCpx::as_floats_mut(fout);
 
-            let fm = vld1q_f32(fout_ptr.add(2 * (idx0 + m)));
+            let fm = ld4(ff, 2 * (idx0 + m));
 
-            let tw1_lo = vld1_f32(tw_ptr.add(2 * tw1));
-            let tw1_hi = vld1_f32(tw_ptr.add(2 * (tw1 + fstride)));
+            let tw1_lo = ld2(twf, 2 * tw1);
+            let tw1_hi = ld2(twf, 2 * (tw1 + fstride));
             let tw1_v = vcombine_f32(tw1_lo, tw1_hi);
 
             let s1 = neon_cmul_2(fm, tw1_v);
 
-            let fm2 = vld1q_f32(fout_ptr.add(2 * (idx0 + m2)));
+            let fm2 = ld4(ff, 2 * (idx0 + m2));
 
-            let tw2_lo = vld1_f32(tw_ptr.add(2 * tw2));
-            let tw2_hi = vld1_f32(tw_ptr.add(2 * (tw2 + stride2)));
+            let tw2_lo = ld2(twf, 2 * tw2);
+            let tw2_hi = ld2(twf, 2 * (tw2 + stride2));
             let tw2_v = vcombine_f32(tw2_lo, tw2_hi);
 
             let s2 = neon_cmul_2(fm2, tw2_v);
@@ -999,24 +1022,24 @@ unsafe fn kf_bfly3_neon_inner(
 
             let half_s3 = vmulq_n_f32(s3, 0.5);
 
-            let f0 = vld1q_f32(fout_ptr.add(2 * idx0));
+            let f0 = ld4(ff, 2 * idx0);
 
             let fout_m = vsubq_f32(f0, half_s3);
 
             let s0_scaled = vmulq_n_f32(s0, epi3_i);
 
-            vst1q_f32(fout_ptr.add(2 * idx0), vaddq_f32(f0, s3));
+            st4(ff, 2 * idx0, vaddq_f32(f0, s3));
 
             let neg_s0 = vnegq_f32(s0_scaled);
             let adj_lo = vext_f32(vget_low_f32(neg_s0), vget_low_f32(s0_scaled), 1);
             let adj_hi = vext_f32(vget_high_f32(neg_s0), vget_high_f32(s0_scaled), 1);
             let adj_m = vcombine_f32(adj_lo, adj_hi);
-            vst1q_f32(fout_ptr.add(2 * (idx0 + m)), vaddq_f32(fout_m, adj_m));
+            st4(ff, 2 * (idx0 + m), vaddq_f32(fout_m, adj_m));
 
             let adj2_lo = vext_f32(vget_low_f32(s0_scaled), vget_low_f32(neg_s0), 1);
             let adj2_hi = vext_f32(vget_high_f32(s0_scaled), vget_high_f32(neg_s0), 1);
             let adj_m2 = vcombine_f32(adj2_lo, adj2_hi);
-            vst1q_f32(fout_ptr.add(2 * (idx0 + m2)), vaddq_f32(fout_m, adj_m2));
+            st4(ff, 2 * (idx0 + m2), vaddq_f32(fout_m, adj_m2));
 
             tw1 += 2 * fstride;
             tw2 += 2 * stride2;
@@ -1044,8 +1067,9 @@ unsafe fn kf_bfly3_neon_inner(
 }
 
 #[cfg(target_arch = "aarch64")]
-#[inline(always)]
-unsafe fn kf_bfly5_neon_inner(
+#[inline]
+#[target_feature(enable = "neon")]
+fn kf_bfly5_neon_inner(
     fout: &mut [KissCpx],
     fstride: usize,
     twiddles: &[KissCpx],
@@ -1053,6 +1077,7 @@ unsafe fn kf_bfly5_neon_inner(
     n: usize,
     mm: usize,
 ) {
+    use crate::simd::neon::{ld2, ld4, st4};
     use core::arch::aarch64::*;
 
     let m2 = 2 * m;
@@ -1067,8 +1092,7 @@ unsafe fn kf_bfly5_neon_inner(
     let yb_r: f32 = -0.809_017;
     let yb_i: f32 = -0.58778525;
 
-    let fout_ptr = fout.as_mut_ptr() as *mut f32;
-    let tw_ptr = twiddles.as_ptr() as *const f32;
+    let twf = KissCpx::as_floats(twiddles);
 
     for i in 0..n {
         let base = i * mm;
@@ -1082,41 +1106,35 @@ unsafe fn kf_bfly5_neon_inner(
 
         while j < m_vec {
             let idx0 = base + j;
+            let ff = KissCpx::as_floats_mut(fout);
 
-            let f0 = vld1q_f32(fout_ptr.add(2 * idx0));
+            let f0 = ld4(ff, 2 * idx0);
 
-            let fm1_v = vld1q_f32(fout_ptr.add(2 * (idx0 + m)));
-            let fm2_v = vld1q_f32(fout_ptr.add(2 * (idx0 + m2)));
-            let fm3_v = vld1q_f32(fout_ptr.add(2 * (idx0 + m3)));
-            let fm4_v = vld1q_f32(fout_ptr.add(2 * (idx0 + m4)));
+            let fm1_v = ld4(ff, 2 * (idx0 + m));
+            let fm2_v = ld4(ff, 2 * (idx0 + m2));
+            let fm3_v = ld4(ff, 2 * (idx0 + m3));
+            let fm4_v = ld4(ff, 2 * (idx0 + m4));
 
-            let tw1_v = vcombine_f32(
-                vld1_f32(tw_ptr.add(2 * tw1)),
-                vld1_f32(tw_ptr.add(2 * (tw1 + fstride))),
-            );
-            let tw2_v = vcombine_f32(
-                vld1_f32(tw_ptr.add(2 * tw2)),
-                vld1_f32(tw_ptr.add(2 * (tw2 + stride2))),
-            );
-            let tw3_v = vcombine_f32(
-                vld1_f32(tw_ptr.add(2 * tw3)),
-                vld1_f32(tw_ptr.add(2 * (tw3 + stride3))),
-            );
-            let tw4_v = vcombine_f32(
-                vld1_f32(tw_ptr.add(2 * tw4)),
-                vld1_f32(tw_ptr.add(2 * (tw4 + stride4))),
-            );
+            let tw1_v = vcombine_f32(ld2(twf, 2 * tw1), ld2(twf, 2 * (tw1 + fstride)));
+            let tw2_v = vcombine_f32(ld2(twf, 2 * tw2), ld2(twf, 2 * (tw2 + stride2)));
+            let tw3_v = vcombine_f32(ld2(twf, 2 * tw3), ld2(twf, 2 * (tw3 + stride3)));
+            let tw4_v = vcombine_f32(ld2(twf, 2 * tw4), ld2(twf, 2 * (tw4 + stride4)));
 
             let s1 = neon_cmul_2(fm1_v, tw1_v);
             let s2 = neon_cmul_2(fm2_v, tw2_v);
             let s3 = neon_cmul_2(fm3_v, tw3_v);
             let s4 = neon_cmul_2(fm4_v, tw4_v);
 
-            let s1_arr: [f32; 4] = core::mem::transmute(s1);
-            let s2_arr: [f32; 4] = core::mem::transmute(s2);
-            let s3_arr: [f32; 4] = core::mem::transmute(s3);
-            let s4_arr: [f32; 4] = core::mem::transmute(s4);
-            let f0_arr: [f32; 4] = core::mem::transmute(f0);
+            let mut s1_arr = [0.0f32; 4];
+            st4(&mut s1_arr, 0, s1);
+            let mut s2_arr = [0.0f32; 4];
+            st4(&mut s2_arr, 0, s2);
+            let mut s3_arr = [0.0f32; 4];
+            st4(&mut s3_arr, 0, s3);
+            let mut s4_arr = [0.0f32; 4];
+            st4(&mut s4_arr, 0, s4);
+            let mut f0_arr = [0.0f32; 4];
+            st4(&mut f0_arr, 0, f0);
 
             for k in 0..2 {
                 let s1r = s1_arr[2 * k];
