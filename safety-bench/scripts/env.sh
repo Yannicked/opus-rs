@@ -1,0 +1,2 @@
+export PATH=$HOME/.cargo/bin:$PATH
+export OPUS_LIB_DIR=${SCRATCH:-/tmp/opus-rs-bench}/libopus16 CMAKE_POLICY_VERSION_MINIMUM=3.5 RUST_MIN_STACK=16777216
