@@ -226,51 +226,29 @@ pub fn haar1(x: &mut [f32], n0: usize, stride: usize) {
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "avx2")]
 fn haar1_avx2(x: &mut [f32], n0: usize) {
-    use crate::simd::x86::{load8, store8};
-    #[cfg(target_arch = "x86")]
-    use core::arch::x86::*;
-    #[cfg(target_arch = "x86_64")]
-    use core::arch::x86_64::*;
+    // The first multiple of eight pairs compute `(a ± b) * scale`, the rest
+    // `scale*a ± scale*b`, as the intrinsics kernel did.
     let n = n0 >> 1;
     let x = &mut x[..2 * n];
-    let scale = _mm256_set1_ps(core::f32::consts::FRAC_1_SQRT_2);
-    let fixup = _mm256_set_epi32(7, 6, 3, 2, 5, 4, 1, 0);
-    let mut j = 0;
-    while j + 8 <= n {
-        let a = load8(x, 2 * j);
-        let b = load8(x, 2 * j + 8);
-
-        let t0 = _mm256_unpacklo_ps(a, b);
-        let t1 = _mm256_unpackhi_ps(a, b);
-
-        // unpacklo/hi leave the two middle quartets swapped; fix the 32-bit
-        // lane order so even/odd hold pairs 0-7 in order.
-        let even = _mm256_permutevar8x32_ps(_mm256_unpacklo_ps(t0, t1), fixup);
-        let odd = _mm256_permutevar8x32_ps(_mm256_unpackhi_ps(t0, t1), fixup);
-
-        let sum = _mm256_mul_ps(_mm256_add_ps(even, odd), scale);
-        let diff = _mm256_mul_ps(_mm256_sub_ps(even, odd), scale);
-
-        let r0 = _mm256_unpacklo_ps(sum, diff);
-        let r1 = _mm256_unpackhi_ps(sum, diff);
-
-        let out0 = _mm256_permute2f128_ps(r0, r1, 0x20);
-        let out1 = _mm256_permute2f128_ps(r0, r1, 0x31);
-
-        store8(x, 2 * j, out0);
-        store8(x, 2 * j + 8, out1);
-        j += 8;
-    }
-
     let scale = core::f32::consts::FRAC_1_SQRT_2;
-    while j < n {
-        let idx1 = 2 * j;
-        let idx2 = 2 * j + 1;
-        let tmp1 = scale * x[idx1];
-        let tmp2 = scale * x[idx2];
-        x[idx1] = tmp1 + tmp2;
-        x[idx2] = tmp1 - tmp2;
-        j += 1;
+    let (head, tail) = x.split_at_mut(16 * (n / 8));
+    for blk in head.as_chunks_mut::<16>().0 {
+        let mut even = [0.0f32; 8];
+        let mut odd = [0.0f32; 8];
+        for k in 0..8 {
+            even[k] = blk[2 * k];
+            odd[k] = blk[2 * k + 1];
+        }
+        for k in 0..8 {
+            blk[2 * k] = (even[k] + odd[k]) * scale;
+            blk[2 * k + 1] = (even[k] - odd[k]) * scale;
+        }
+    }
+    for p in tail.as_chunks_mut::<2>().0 {
+        let tmp1 = scale * p[0];
+        let tmp2 = scale * p[1];
+        p[0] = tmp1 + tmp2;
+        p[1] = tmp1 - tmp2;
     }
 }
 
