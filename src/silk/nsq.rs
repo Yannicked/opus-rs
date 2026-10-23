@@ -217,58 +217,44 @@ fn silk_nsq_noise_shape_feedback_loop(
     coef: &[i16],
     order: usize,
 ) -> i32 {
-    if order == 12 {
-        return silk_nsq_noise_shape_feedback_loop_order12(data0_val, data1, coef);
+    // The delay line shifts by one with `data0_val` entering at the front,
+    // and the output is `order/2` plus the shifted line times `coef`, summed
+    // in tap order. Common orders get a fixed-size copy with no bounds
+    // checks in the loop.
+    match order {
+        8 => feedback_fixed::<8>(data0_val, data1, coef),
+        10 => feedback_fixed::<10>(data0_val, data1, coef),
+        12 => feedback_fixed::<12>(data0_val, data1, coef),
+        14 => feedback_fixed::<14>(data0_val, data1, coef),
+        16 => feedback_fixed::<16>(data0_val, data1, coef),
+        20 => feedback_fixed::<20>(data0_val, data1, coef),
+        24 => feedback_fixed::<24>(data0_val, data1, coef),
+        _ => {
+            let data1 = &mut data1[..order];
+            let coef = &coef[..order];
+            data1.copy_within(..order - 1, 1);
+            data1[0] = data0_val;
+            let mut out = (order as i32) >> 1;
+            for (&d, &c) in data1.iter().zip(coef) {
+                out = silk_smlawb(out, d, c as i32);
+            }
+            out << 1
+        }
     }
-
-    let data1 = &mut data1[..order];
-    let coef = &coef[..order];
-    let mut tmp2 = data0_val;
-    let mut tmp1 = data1[0];
-    data1[0] = tmp2;
-
-    let mut out = (order as i32) >> 1;
-    out = silk_smlawb(out, tmp2, coef[0] as i32);
-
-    let mut j = 2;
-    while j < order {
-        tmp2 = data1[j - 1];
-        data1[j - 1] = tmp1;
-        out = silk_smlawb(out, tmp1, coef[j - 1] as i32);
-        tmp1 = data1[j];
-        data1[j] = tmp2;
-        out = silk_smlawb(out, tmp2, coef[j] as i32);
-        j += 2;
-    }
-    data1[order - 1] = tmp1;
-    out = silk_smlawb(out, tmp1, coef[order - 1] as i32);
-
-    out <<= 1;
-    out
 }
 
 #[inline(always)]
-fn silk_nsq_noise_shape_feedback_loop_order12(
-    data0_val: i32,
-    data1: &mut [i32],
-    coef: &[i16],
-) -> i32 {
-    // Shift the 12-entry delay line by one, feeding `data0_val` in front,
-    // and take the dot product of the old line with `coef`.
-    let data1 = &mut data1[..12];
-    let coef = &coef[..12];
-    let mut d = [0i32; 12];
-    d[0] = data0_val;
-    d[1..].copy_from_slice(&data1[..11]);
-    data1.copy_from_slice(&d);
-
-    let mut out = 6i32;
-    for j in 0..12 {
-        out = silk_smlawb(out, d[j], coef[j] as i32);
+fn feedback_fixed<const N: usize>(data0_val: i32, data1: &mut [i32], coef: &[i16]) -> i32 {
+    let (Some(line), Some(coef)) = (data1.first_chunk_mut::<N>(), coef.first_chunk::<N>()) else {
+        panic!("noise shaping needs {N} taps");
+    };
+    let old = *line;
+    *line = core::array::from_fn(|k| if k == 0 { data0_val } else { old[k - 1] });
+    let mut out = (N as i32) >> 1;
+    for k in 0..N {
+        out = silk_smlawb(out, line[k], coef[k] as i32);
     }
-
-    out <<= 1;
-    out
+    out << 1
 }
 
 fn silk_noise_shape_quantizer(
@@ -349,8 +335,12 @@ fn silk_noise_shape_quantizer(
 /// SILK's Q16 multiply-accumulate, accumulated in order of increasing `j`.
 #[inline(always)]
 fn lpc_pred_order<const N: usize>(s_lpc: &[i32], a_q12: &[i16], idx: usize) -> i32 {
-    let s = &s_lpc[idx + 1 - N..=idx];
-    let a = &a_q12[..N];
+    let (Some(s), Some(a)) = (
+        s_lpc[idx + 1 - N..].first_chunk::<N>(),
+        a_q12.first_chunk::<N>(),
+    ) else {
+        panic!("LPC prediction needs {N} samples and coefficients");
+    };
     let mut pred = (N as i32) >> 1;
     for j in 0..N {
         pred = silk_smlawb(pred, s[N - 1 - j], a[j] as i32);
