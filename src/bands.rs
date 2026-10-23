@@ -2538,30 +2538,8 @@ pub fn normalise_bands(
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 fn scale_slice_avx2(src: &[f32], dst: &mut [f32], scale: f32, n: usize) {
-    use crate::simd::x86::{load8, store8};
-    #[cfg(target_arch = "x86")]
-    use core::arch::x86::*;
-    #[cfg(target_arch = "x86_64")]
-    use core::arch::x86_64::*;
-    let src = &src[..n];
-    let dst = &mut dst[..n];
-    let vscale = _mm256_set1_ps(scale);
-    let mut i = 0;
-
-    while i + 16 <= n {
-        let s0 = load8(src, i);
-        let s1 = load8(src, i + 8);
-        store8(dst, i, _mm256_mul_ps(s0, vscale));
-        store8(dst, i + 8, _mm256_mul_ps(s1, vscale));
-        i += 16;
-    }
-    while i + 8 <= n {
-        let sv = load8(src, i);
-        store8(dst, i, _mm256_mul_ps(sv, vscale));
-        i += 8;
-    }
-    for j in i..n {
-        dst[j] = src[j] * scale;
+    for (d, &s) in dst[..n].iter_mut().zip(&src[..n]) {
+        *d = s * scale;
     }
 }
 
