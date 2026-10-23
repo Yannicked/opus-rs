@@ -126,28 +126,27 @@ fn silk_nsq_del_dec_scale_states(
 }
 
 #[cfg(target_arch = "aarch64")]
-#[inline(always)]
-#[allow(unsafe_op_in_unsafe_fn)]
-unsafe fn silk_lpc_prediction_neon(
+#[inline]
+#[target_feature(enable = "neon")]
+fn silk_lpc_prediction_neon(
     ps_lpc_q14: &[i32],
     idx: usize,
     a_q12: &[i16],
     predict_lpc_order: i32,
 ) -> i32 {
+    use crate::simd::neon::{ld4_s16, ld4_s32};
     use core::arch::aarch64::*;
 
     let order = predict_lpc_order as usize;
-    let lpc_base = ps_lpc_q14.as_ptr().add(idx);
-    let a_ptr = a_q12.as_ptr();
 
     let mut acc = vdupq_n_s32(0i32);
     let neon_taps = order & !3;
 
     let mut j = 0usize;
     while j < neon_taps {
-        let lpc_asc = vld1q_s32(lpc_base.sub(j + 3));
+        let lpc_asc = ld4_s32(ps_lpc_q14, idx - (j + 3));
 
-        let coef_narrow = vld1_s16(a_ptr.add(j));
+        let coef_narrow = ld4_s16(a_q12, j);
         let coef_wide = vmovl_s16(coef_narrow);
 
         let coef_rev = vrev64q_s32(vcombine_s32(
@@ -183,10 +182,8 @@ fn silk_noise_shape_quantizer_short_prediction(
     predict_lpc_order: i32,
 ) -> i32 {
     #[cfg(target_arch = "aarch64")]
-    // SAFETY: aarch64 always has NEON; bounds are guaranteed by SILK frame sizing.
-    unsafe {
-        return silk_lpc_prediction_neon(ps_lpc_q14, idx, a_q12, predict_lpc_order);
-    }
+    // SAFETY: NEON is part of the aarch64 baseline.
+    return unsafe { silk_lpc_prediction_neon(ps_lpc_q14, idx, a_q12, predict_lpc_order) };
     #[allow(unreachable_code)]
     {
         let mut out = silk_rshift(predict_lpc_order, 1);
