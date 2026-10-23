@@ -199,17 +199,20 @@ fn upsample_scale_zero(freq: &mut [f32], frame_size: usize, upsample: usize, cha
 use core::arch::aarch64::*;
 
 #[cfg(target_arch = "aarch64")]
-#[inline(always)]
-#[allow(unsafe_op_in_unsafe_fn)]
-unsafe fn sum_abs_neon(x: &[f32], n: usize) -> f32 {
+#[inline]
+#[target_feature(enable = "neon")]
+fn sum_abs_neon(x: &[f32], n: usize) -> f32 {
+    use crate::simd::neon::ld4;
+
+    let x = &x[..n];
     let mut sum_vec = vdupq_n_f32(0.0);
     let mut i = 0;
 
     while i + 16 <= n {
-        let x0 = vld1q_f32(x.as_ptr().add(i));
-        let x1 = vld1q_f32(x.as_ptr().add(i + 4));
-        let x2 = vld1q_f32(x.as_ptr().add(i + 8));
-        let x3 = vld1q_f32(x.as_ptr().add(i + 12));
+        let x0 = ld4(x, i);
+        let x1 = ld4(x, i + 4);
+        let x2 = ld4(x, i + 8);
+        let x3 = ld4(x, i + 12);
 
         sum_vec = vfmaq_f32(sum_vec, vabsq_f32(x0), vdupq_n_f32(1.0));
         sum_vec = vfmaq_f32(sum_vec, vabsq_f32(x1), vdupq_n_f32(1.0));
@@ -220,15 +223,15 @@ unsafe fn sum_abs_neon(x: &[f32], n: usize) -> f32 {
     }
 
     while i + 8 <= n {
-        let x0 = vld1q_f32(x.as_ptr().add(i));
-        let x1 = vld1q_f32(x.as_ptr().add(i + 4));
+        let x0 = ld4(x, i);
+        let x1 = ld4(x, i + 4);
         sum_vec = vfmaq_f32(sum_vec, vabsq_f32(x0), vdupq_n_f32(1.0));
         sum_vec = vfmaq_f32(sum_vec, vabsq_f32(x1), vdupq_n_f32(1.0));
         i += 8;
     }
 
     while i + 4 <= n {
-        let x0 = vld1q_f32(x.as_ptr().add(i));
+        let x0 = ld4(x, i);
         sum_vec = vfmaq_f32(sum_vec, vabsq_f32(x0), vdupq_n_f32(1.0));
         i += 4;
     }
@@ -245,12 +248,12 @@ unsafe fn sum_abs_neon(x: &[f32], n: usize) -> f32 {
 #[inline(always)]
 fn sum_abs(x: &[f32]) -> f32 {
     #[cfg(target_arch = "x86_64")]
-    unsafe {
-        if crate::compat::x86_has_avx() {
-            return sum_abs_avx(x, x.len());
-        }
+    if crate::compat::x86_has_avx() {
+        // SAFETY: the CPU supports AVX, checked just above.
+        return unsafe { sum_abs_avx(x, x.len()) };
     }
     #[cfg(target_arch = "aarch64")]
+    // SAFETY: NEON is part of the aarch64 baseline.
     unsafe {
         sum_abs_neon(x, x.len())
     }
@@ -410,14 +413,14 @@ fn transient_analysis(
 
 fn l1_metric(tmp: &[f32], n: usize, lm: i32, bias: f32) -> f32 {
     #[cfg(target_arch = "x86_64")]
-    unsafe {
-        if n >= 16 && crate::compat::x86_has_avx() {
-            return l1_metric_avx(tmp, n, lm, bias);
-        }
+    if n >= 16 && crate::compat::x86_has_avx() {
+        // SAFETY: the CPU supports AVX, checked just above.
+        return unsafe { l1_metric_avx(tmp, n, lm, bias) };
     }
     #[cfg(target_arch = "aarch64")]
     {
         if n >= 16 {
+            // SAFETY: NEON is part of the aarch64 baseline.
             return unsafe { l1_metric_neon(tmp, n, lm, bias) };
         }
     }
@@ -431,11 +434,14 @@ fn l1_metric(tmp: &[f32], n: usize, lm: i32, bias: f32) -> f32 {
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx")]
-unsafe fn sum_abs_avx(x: &[f32], n: usize) -> f32 {
+fn sum_abs_avx(x: &[f32], n: usize) -> f32 {
+    use crate::simd::x86::load8;
     #[cfg(target_arch = "x86")]
     use core::arch::x86::*;
     #[cfg(target_arch = "x86_64")]
     use core::arch::x86_64::*;
+
+    let x = &x[..n];
 
     let mut sum0 = _mm256_setzero_ps();
     let mut sum1 = _mm256_setzero_ps();
@@ -443,15 +449,15 @@ unsafe fn sum_abs_avx(x: &[f32], n: usize) -> f32 {
     let sign_mask = _mm256_set1_ps(-0.0);
 
     while i + 16 <= n {
-        let v0 = _mm256_loadu_ps(x.as_ptr().add(i));
-        let v1 = _mm256_loadu_ps(x.as_ptr().add(i + 8));
+        let v0 = load8(x, i);
+        let v1 = load8(x, i + 8);
         sum0 = _mm256_add_ps(sum0, _mm256_andnot_ps(sign_mask, v0));
         sum1 = _mm256_add_ps(sum1, _mm256_andnot_ps(sign_mask, v1));
         i += 16;
     }
 
     while i + 8 <= n {
-        let v = _mm256_loadu_ps(x.as_ptr().add(i));
+        let v = load8(x, i);
         sum0 = _mm256_add_ps(sum0, _mm256_andnot_ps(sign_mask, v));
         i += 8;
     }
@@ -474,49 +480,50 @@ unsafe fn sum_abs_avx(x: &[f32], n: usize) -> f32 {
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx")]
-unsafe fn l1_metric_avx(tmp: &[f32], n: usize, lm: i32, bias: f32) -> f32 {
+fn l1_metric_avx(tmp: &[f32], n: usize, lm: i32, bias: f32) -> f32 {
     let l1 = sum_abs_avx(tmp, n);
     l1 + (lm as f32) * bias * l1
 }
 
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
-unsafe fn l1_metric_neon(tmp: &[f32], n: usize, lm: i32, bias: f32) -> f32 {
-    unsafe {
-        let mut sum4 = vdupq_n_f32(0.0);
-        let mut i = 0;
+fn l1_metric_neon(tmp: &[f32], n: usize, lm: i32, bias: f32) -> f32 {
+    use crate::simd::neon::ld4;
 
-        while i + 15 < n {
-            let v0 = vld1q_f32(tmp.as_ptr().add(i));
-            let v1 = vld1q_f32(tmp.as_ptr().add(i + 4));
-            let v2 = vld1q_f32(tmp.as_ptr().add(i + 8));
-            let v3 = vld1q_f32(tmp.as_ptr().add(i + 12));
+    let tmp = &tmp[..n];
+    let mut sum4 = vdupq_n_f32(0.0);
+    let mut i = 0;
 
-            sum4 = vaddq_f32(sum4, vabsq_f32(v0));
-            sum4 = vaddq_f32(sum4, vabsq_f32(v1));
-            sum4 = vaddq_f32(sum4, vabsq_f32(v2));
-            sum4 = vaddq_f32(sum4, vabsq_f32(v3));
+    while i + 15 < n {
+        let v0 = ld4(tmp, i);
+        let v1 = ld4(tmp, i + 4);
+        let v2 = ld4(tmp, i + 8);
+        let v3 = ld4(tmp, i + 12);
 
-            i += 16;
-        }
+        sum4 = vaddq_f32(sum4, vabsq_f32(v0));
+        sum4 = vaddq_f32(sum4, vabsq_f32(v1));
+        sum4 = vaddq_f32(sum4, vabsq_f32(v2));
+        sum4 = vaddq_f32(sum4, vabsq_f32(v3));
 
-        while i + 3 < n {
-            let v = vld1q_f32(tmp.as_ptr().add(i));
-            sum4 = vaddq_f32(sum4, vabsq_f32(v));
-            i += 4;
-        }
-
-        let sum2 = vpaddq_f32(sum4, sum4);
-        let sum1 = vpaddq_f32(sum2, sum2);
-        let mut l1 = vgetq_lane_f32(sum1, 0);
-
-        while i < n {
-            l1 += tmp[i].abs();
-            i += 1;
-        }
-
-        l1 + (lm as f32) * bias * l1
+        i += 16;
     }
+
+    while i + 3 < n {
+        let v = ld4(tmp, i);
+        sum4 = vaddq_f32(sum4, vabsq_f32(v));
+        i += 4;
+    }
+
+    let sum2 = vpaddq_f32(sum4, sum4);
+    let sum1 = vpaddq_f32(sum2, sum2);
+    let mut l1 = vgetq_lane_f32(sum1, 0);
+
+    while i < n {
+        l1 += tmp[i].abs();
+        i += 1;
+    }
+
+    l1 + (lm as f32) * bias * l1
 }
 
 const MAX_NB_EBANDS: usize = 21;
