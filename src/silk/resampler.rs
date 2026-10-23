@@ -340,7 +340,7 @@ impl SilkResampler {
             // Down-FIR runs without the 2x pre-upsampling: invRatio_Q16 uses
             // up2x = 0 (resampler.c:152-158).
             self.inv_ratio_q16 = ((((fs_hz_in as i64) << 14) / fs_hz_out as i64) << 2) as i32;
-            while silk_smulww(self.inv_ratio_q16, fs_hz_out) < (fs_hz_in << 0) {
+            while silk_smulww(self.inv_ratio_q16, fs_hz_out) < fs_hz_in {
                 self.inv_ratio_q16 += 1;
             }
         }

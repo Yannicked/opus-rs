@@ -1016,7 +1016,7 @@ impl OpusEncoder {
                 // comes from delay_matrix_enc.
                 let ret = self
                     .silk_resampler_enc
-                    .init_for_enc(self.sampling_rate as i32, silk_fs_khz * 1000);
+                    .init_for_enc(self.sampling_rate, silk_fs_khz * 1000);
                 if ret != 0 {
                     return Err("Unsupported SILK resampling ratio");
                 }
@@ -1175,12 +1175,12 @@ impl OpusEncoder {
                 self.buf_silk_input_right.resize(silk_frame_len_samples, 0);
                 for c in 0..2 {
                     self.buf_silk_api_channel.resize(frame_size, 0);
-                    for (s, lr) in self
+                    for (s, x) in self
                         .buf_silk_api_channel
                         .iter_mut()
-                        .zip(input_i16.chunks_exact(2))
+                        .zip(input_i16.iter().skip(c).step_by(2))
                     {
-                        *s = lr[c];
+                        *s = *x;
                     }
                     let (resampler, out) = if c == 0 {
                         (

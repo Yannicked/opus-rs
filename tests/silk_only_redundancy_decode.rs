@@ -58,7 +58,9 @@ fn libopus_packets(input: &[f32], app: CApp, setup: impl Fn(usize, &mut CEnc)) -
     let mut enc = CEnc::new(RATE as u32, CCh::Mono, app).unwrap();
     let mut pkt = vec![0u8; 1500];
     input
-        .chunks_exact(FRAME)
+        .as_chunks::<FRAME>()
+        .0
+        .iter()
         .enumerate()
         .map(|(i, f)| {
             setup(i, &mut enc);

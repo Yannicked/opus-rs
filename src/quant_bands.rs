@@ -358,21 +358,20 @@ pub fn unquant_coarse_energy(
 
     for i in start..end {
         for c in 0..channels {
-            let qi;
             let tell = dec.tell();
-            if budget - tell >= 15 {
+            let qi = if budget - tell >= 15 {
                 let prob_idx = 2 * i.min(20);
                 let fs = (prob_model[prob_idx] as u32) << 7;
                 let decay = (prob_model[prob_idx + 1] as i32) << 6;
-                qi = dec.laplace_decode(fs, decay);
+                dec.laplace_decode(fs, decay)
             } else if budget - tell >= 2 {
                 let s = dec.decode_icdf(&SMALL_ENERGY_ICDF, 2);
-                qi = (s >> 1) ^ -(s & 1);
+                (s >> 1) ^ -(s & 1)
             } else if budget - tell >= 1 {
-                qi = if dec.decode_bit_logp(1) { -1 } else { 0 };
+                if dec.decode_bit_logp(1) { -1 } else { 0 }
             } else {
-                qi = -1;
-            }
+                -1
+            };
 
             // Clamp in-place, matching C: oldEBands[i] = MAXG(-GCONST(9.f), oldEBands[i])
             old_e_bands[c * m.nb_ebands + i] = old_e_bands[c * m.nb_ebands + i].max(-9.0);
