@@ -44,11 +44,18 @@ impl<T, const N: usize> FixedVec<T, N> {
         s
     }
 
+    /// Writes a buffer of `len` clones of `value` into `this` in place.
+    ///
+    /// # Safety
+    /// `this` must be valid for writes and aligned for `Self`; its previous
+    /// contents are overwritten without being dropped.
     pub(crate) unsafe fn write_from_value(this: *mut Self, value: T, len: usize)
     where
         T: Clone,
     {
         assert!(len <= N, "FixedVec capacity exceeded");
+        // SAFETY: per the contract above; `len <= N` keeps the element writes
+        // inside `buf`, and `len` is set only after they are all written.
         unsafe {
             let buf = (&raw mut (*this).buf).cast::<MaybeUninit<T>>();
             for i in 0..len {
@@ -93,6 +100,7 @@ impl<T, const N: usize> FixedVec<T, N> {
 
     /// View the initialized elements as a mutable slice.
     pub fn as_mut_slice(&mut self) -> &mut [T] {
+        // SAFETY: as in `as_slice`; `&mut self` makes the borrow exclusive.
         unsafe { core::slice::from_raw_parts_mut(self.buf.as_mut_ptr() as *mut T, self.len) }
     }
 
@@ -128,6 +136,8 @@ impl<T, const N: usize> FixedVec<T, N> {
             }
         } else {
             for i in new_len..self.len {
+                // SAFETY: `i < len`, so the slot is initialised; `len` is
+                // lowered right after, so it is never dropped twice.
                 unsafe { self.buf[i].assume_init_drop() };
             }
         }
@@ -137,6 +147,7 @@ impl<T, const N: usize> FixedVec<T, N> {
     pub fn truncate(&mut self, new_len: usize) {
         if new_len < self.len {
             for i in new_len..self.len {
+                // SAFETY: as in `resize`.
                 unsafe { self.buf[i].assume_init_drop() };
             }
             self.len = new_len;
@@ -211,11 +222,8 @@ impl<T: Clone, const N: usize> Clone for FixedVec<T, N> {
 impl<T, const N: usize> Drop for FixedVec<T, N> {
     fn drop(&mut self) {
         for i in 0..self.len {
+            // SAFETY: `buf[..len]` is initialised and dropped exactly once here.
             unsafe { self.buf[i].assume_init_drop() };
         }
     }
 }
-
-// `FixedVec` owns its storage inline and (once fully initialized) is safe to share.
-unsafe impl<T: Sync, const N: usize> Sync for FixedVec<T, N> {}
-unsafe impl<T: Send, const N: usize> Send for FixedVec<T, N> {}

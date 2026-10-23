@@ -36,13 +36,23 @@ impl Default for SilkDecoder {
 impl SilkDecoder {
     pub fn new() -> Self {
         let mut decoder = MaybeUninit::uninit();
+        // SAFETY: `write_new` initialises every field of the slot it is given.
         unsafe {
             Self::write_new(decoder.as_mut_ptr());
             decoder.assume_init()
         }
     }
 
+    /// Writes a fresh decoder into `this` field by field, so a large decoder
+    /// can be built in place without passing through the stack.
+    ///
+    /// # Safety
+    /// `this` must be valid for writes and aligned for `Self`. Its previous
+    /// contents are overwritten without being dropped.
     pub(crate) unsafe fn write_new(this: *mut Self) {
+        // SAFETY: per the contract above; each field is written through a raw
+        // place pointer, and `channel_state[i]` is only borrowed after it has
+        // been written. The writes must cover every field.
         unsafe {
             let states = (&raw mut (*this).channel_state).cast::<SilkDecoderState>();
             for i in 0..2 {

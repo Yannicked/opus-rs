@@ -3023,12 +3023,19 @@ impl CeltDecoder {
     /// decimates by `resampling_factor(sampling_rate)` on output.
     pub fn new(mode: &'static CeltMode, channels: usize, sampling_rate: i32) -> Self {
         let mut decoder = MaybeUninit::uninit();
+        // SAFETY: `write_new` initialises every field of the slot it is given.
         unsafe {
             Self::write_new(decoder.as_mut_ptr(), mode, channels, sampling_rate);
             decoder.assume_init()
         }
     }
 
+    /// Writes a fresh decoder into `this` field by field, so a large decoder
+    /// can be built in place without passing through the stack.
+    ///
+    /// # Safety
+    /// `this` must be valid for writes and aligned for `Self`. Its previous
+    /// contents are overwritten without being dropped.
     pub(crate) unsafe fn write_new(
         this: *mut Self,
         mode: &'static CeltMode,
@@ -3048,6 +3055,8 @@ impl CeltDecoder {
         // may be handed one. Capacity is fixed, so this costs no memory.
         let nb_x_ch = nb_ebands * CELT_MAX_CHANNELS;
         let dec_frame_x_ch = DECODE_BUFFER_SIZE * CELT_MAX_CHANNELS;
+        // SAFETY: per the contract above; each field is written once through
+        // a raw place pointer. The writes must cover every field.
         unsafe {
             (&raw mut (*this).mode).write(mode);
             (&raw mut (*this).channels).write(channels);

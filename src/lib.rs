@@ -1,5 +1,4 @@
 #![cfg_attr(not(feature = "std"), no_std)]
-#![allow(unsafe_op_in_unsafe_fn)]
 #![allow(clippy::too_many_arguments)]
 #![allow(clippy::needless_range_loop)]
 
@@ -1731,6 +1730,7 @@ impl OpusDecoder {
     pub fn new(sampling_rate: i32, channels: usize) -> Result<Self, &'static str> {
         let mut decoder = MaybeUninit::uninit();
         Self::init(&mut decoder, sampling_rate, channels)?;
+        // SAFETY: `init` returned Ok, so it wrote every field of `decoder`.
         Ok(unsafe { decoder.assume_init() })
     }
 
@@ -1753,6 +1753,10 @@ impl OpusDecoder {
 
         let mode = modes::default_mode();
         let this = slot.as_mut_ptr();
+        // SAFETY: `this` points to writable, suitably aligned storage for a
+        // `Self`. Each field is written once through a raw place pointer,
+        // without creating a reference to uninitialised memory; the list
+        // below must cover every field of `OpusDecoder`.
         unsafe {
             #[cfg(feature = "heap")]
             {
@@ -1829,6 +1833,7 @@ impl OpusDecoder {
             }
         }
 
+        // SAFETY: every field was written just above.
         let decoder = unsafe { slot.assume_init_mut() };
         decoder
             .silk_dec
