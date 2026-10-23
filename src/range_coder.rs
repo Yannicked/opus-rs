@@ -24,10 +24,10 @@ macro_rules! tell_frac_inline {
         let r = $rc.rng >> (l - 16);
         let b = (r >> 12).wrapping_sub(8);
 
-        // `rng` is normalized (> 2^23) between symbols, so `b` is in 0..8;
-        // the checked index costs nothing measurable and keeps a broken
-        // invariant from reading past the table.
-        let correction = CORRECTION[b as usize];
+        // `rng` is normalized (> 2^23) between symbols, so `b` is in 0..8.
+        // The mask makes that visible to the compiler (no bounds check) and
+        // keeps a broken invariant from reading past the table.
+        let correction = CORRECTION[(b & 7) as usize];
         let b = b + (r > correction) as u32;
         nbits - (l << 3) - b as i32
     }};
