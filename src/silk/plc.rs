@@ -363,7 +363,6 @@ pub fn silk_plc_glue_frames(ps_dec: &mut SilkDecoderState, frame: &mut [i16], le
 
             // Fade in the energy difference.
             if energy > ps_dec.s_plc.conc_energy {
-                
                 let lz = silk_clz32(ps_dec.s_plc.conc_energy) - 1;
                 ps_dec.s_plc.conc_energy = silk_lshift(ps_dec.s_plc.conc_energy, lz);
                 energy = silk_rshift(energy, (24 - lz).max(0));

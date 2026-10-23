@@ -1815,7 +1815,7 @@ fn tone_lpc(x: &[f32], len: usize, delay: usize, lpc: &mut [f32; 2]) -> bool {
     let mut r02 = 0.0f32;
     let mut r11: f32;
     let mut r12: f32;
-    
+
     for i in 0..len - 2 * delay {
         r00 += x[i] * x[i];
         r01 += x[i] * x[i + delay];
@@ -1837,13 +1837,7 @@ fn tone_lpc(x: &[f32], len: usize, delay: usize, lpc: &mut [f32; 2]) -> bool {
     }
     r12 = r01 + edges;
     // Reverse and sum to get backward contribution (float: simple sums)
-    let (rr00, rr01, rr11, rr02, rr12) = (
-        r00 + r22,
-        r01 + r12,
-        2.0 * r11,
-        2.0 * r02,
-        r12 + r01,
-    );
+    let (rr00, rr01, rr11, rr02, rr12) = (r00 + r22, r01 + r12, 2.0 * r11, 2.0 * r02, r12 + r01);
     r00 = rr00;
     r01 = rr01;
     r11 = rr11;
@@ -2618,15 +2612,7 @@ impl CeltEncoder {
             upsample_scale_zero(freq, frame_size, upsample, channels);
 
             compute_band_energies(mode, freq, band_e, end, channels, lm);
-            normalise_bands(
-                mode,
-                freq,
-                x,
-                band_e,
-                end,
-                channels,
-                (1 << lm) as usize,
-            );
+            normalise_bands(mode, freq, x, band_e, end, channels, (1 << lm) as usize);
             crate::bands::amp2log2(mode, start_band, end, band_e, band_log_e, channels);
         } else {
             // Long MDCT (non-transient)
@@ -2644,15 +2630,7 @@ impl CeltEncoder {
             }
             upsample_scale_zero(freq, frame_size, upsample, channels);
             compute_band_energies(mode, freq, band_e, end, channels, lm);
-            normalise_bands(
-                mode,
-                freq,
-                x,
-                band_e,
-                end,
-                channels,
-                (1 << lm) as usize,
-            );
+            normalise_bands(mode, freq, x, band_e, end, channels, (1 << lm) as usize);
             crate::bands::amp2log2(mode, start_band, end, band_e, band_log_e, channels);
         }
 
@@ -2874,8 +2852,7 @@ impl CeltEncoder {
             let min_allowed = {
                 let a = ((cur_tell_frac + tot_boost + (1 << (BITRES + 3)) - 1) >> (BITRES + 3)) + 2;
                 if hybrid {
-                    let b = (tell_initial_frac + (37 << BITRES) + tot_boost
-                        + (1 << (BITRES + 3))
+                    let b = (tell_initial_frac + (37 << BITRES) + tot_boost + (1 << (BITRES + 3))
                         - 1)
                         >> (BITRES + 3);
                     a.max(b)
@@ -2884,14 +2861,8 @@ impl CeltEncoder {
                 }
             };
             // nbCompressedBytes is current max (after first VBR bound), effectiveBytes ~ vbr_rate>>(3+BITRES) for lambda already
-            let max_depth = compute_max_depth(
-                mode,
-                band_log_e,
-                nb_ebands,
-                channels,
-                end,
-                self.lsb_depth,
-            );
+            let max_depth =
+                compute_max_depth(mode, band_log_e, nb_ebands, channels, end, self.lsb_depth);
             let mut target = if !hybrid {
                 compute_vbr(
                     mode,
@@ -2939,7 +2910,7 @@ impl CeltEncoder {
             let alpha = if self.vbr_count < 970 {
                 // celt_rcp((vbr_count+20)<<16) in Q15 is 32768/(vbr_count+20)
                 let v = self.vbr_count + 20;
-                32768 / v  // Q15
+                32768 / v // Q15
             } else {
                 33 // QCONST16(0.001,15) ~33
             };

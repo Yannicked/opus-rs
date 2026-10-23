@@ -60,8 +60,7 @@ fn issue46_low_cbr() {
         enc.use_cbr = true;
         let input: Vec<f32> = (0..frame)
             .map(|i| {
-                (0.3
-                    * (2.0 * std::f32::consts::PI * 150.0 * i as f32 / sr as f32).sin()
+                (0.3 * (2.0 * std::f32::consts::PI * 150.0 * i as f32 / sr as f32).sin()
                     + 0.1 * (i % 7) as f32 / 7.0)
             })
             .collect();

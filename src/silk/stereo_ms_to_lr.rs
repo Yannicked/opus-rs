@@ -12,7 +12,6 @@ pub struct StereoDecState {
     pub s_side: [i16; 2],
 }
 
-
 /// Convert adaptive Mid/Side representation to Left/Right stereo signal.
 /// Ported from libopus `silk/stereo_MS_to_LR.c`.
 ///

@@ -28,8 +28,8 @@ pub mod silk;
 pub use silk::{SilkResampler, SilkResamplerDown1_3, SilkResamplerDown1_6};
 
 use crate::fixedvec::FixedVec;
-use core::mem::MaybeUninit;
 pub use celt::{CeltDecoder, CeltEncoder};
+use core::mem::MaybeUninit;
 use hp_cutoff::{dc_reject_float, hp_cutoff, hp_cutoff_float, hp_cutoff_i16};
 use range_coder::RangeCoder;
 use silk::control_codec::{silk_control_encoder, silk_setup_lbrr};
@@ -295,10 +295,8 @@ fn decide_fec(
             lbrr_rate_thres_bps += hysteresis;
         }
         // silk_SMULWB(threshold * (125 - min(loss, 25)), 0.01 in Q16)
-        lbrr_rate_thres_bps = silk_smulwb(
-            lbrr_rate_thres_bps * (125 - packet_loss_perc.min(25)),
-            655,
-        );
+        lbrr_rate_thres_bps =
+            silk_smulwb(lbrr_rate_thres_bps * (125 - packet_loss_perc.min(25)), 655);
         // If loss <= 5%, we look at whether we have enough rate to enable FEC.
         // If loss > 5%, we decrease the bandwidth until we can enable FEC.
         if rate > lbrr_rate_thres_bps {
@@ -496,7 +494,11 @@ impl OpusEncoder {
 
         let mode = modes::default_mode();
         #[cfg(feature = "heap")]
-        let celt_enc = Box::new(CeltEncoder::with_sampling_rate(mode, channels, sampling_rate));
+        let celt_enc = Box::new(CeltEncoder::with_sampling_rate(
+            mode,
+            channels,
+            sampling_rate,
+        ));
         #[cfg(not(feature = "heap"))]
         let celt_enc = CeltEncoder::with_sampling_rate(mode, channels, sampling_rate);
 
@@ -860,11 +862,9 @@ impl OpusEncoder {
         // loss. Encoding into 0-2 bytes would otherwise overflow the range
         // coder (issue #45). Under CBR the packet is padded to the nominal
         // size, exactly like libopus's opus_packet_pad.
-        let sub_3_bytes_per_frame =
-            (self.bitrate_bps as i64) < 3 * frame_rate as i64 * 8;
+        let sub_3_bytes_per_frame = (self.bitrate_bps as i64) < 3 * frame_rate as i64 * 8;
         let tiny_long_frame =
-            frame_rate < 50
-                && (n_bytes * (frame_rate as usize) < 300 || self.bitrate_bps < 2400);
+            frame_rate < 50 && (n_bytes * (frame_rate as usize) < 300 || self.bitrate_bps < 2400);
         if n_bytes < 3 || sub_3_bytes_per_frame || tiny_long_frame {
             let mut toc_mode = mode;
             let mut packet_code = 0u8;
@@ -984,8 +984,7 @@ impl OpusEncoder {
             // C opus_encoder.c:1448-1455: (re)entering SILK/hybrid from CELT
             // resets the SILK encoder and prefills it with recent (ramped)
             // audio, so the first SILK frame starts from valid history.
-            let silk_restart_after_celt =
-                self.prev_enc_mode == Some(OpusMode::CeltOnly);
+            let silk_restart_after_celt = self.prev_enc_mode == Some(OpusMode::CeltOnly);
             if silk_restart_after_celt {
                 silk_init_encoder(state_mut(&mut self.silk_enc), 0);
                 // C silk_InitEncoder also clears the packet-level rate state.
@@ -1065,8 +1064,7 @@ impl OpusEncoder {
             // the tail of the delay buffer, zeroed before a 2.5 ms fade-in,
             // resampled through the fresh encoder resampler so its delay
             // state also starts consistent.
-            if silk_restart_after_celt && self.encoder_buffer > 0 && self.delay_compensation > 0
-            {
+            if silk_restart_after_celt && self.encoder_buffer > 0 && self.delay_compensation > 0 {
                 let ch = self.channels;
                 let f2_5 = self.sampling_rate / 400;
                 let eb = self.encoder_buffer;
@@ -1632,15 +1630,14 @@ impl OpusEncoder {
 
         let toc = sub[0][0] & 0xFC;
         let mut pos = 0usize;
-        let push =
-            |out: &mut [u8], pos: &mut usize, byte: u8| -> Result<(), &'static str> {
-                if *pos >= out.len() {
-                    return Err("Output buffer too small");
-                }
-                out[*pos] = byte;
-                *pos += 1;
-                Ok(())
-            };
+        let push = |out: &mut [u8], pos: &mut usize, byte: u8| -> Result<(), &'static str> {
+            if *pos >= out.len() {
+                return Err("Output buffer too small");
+            }
+            out[*pos] = byte;
+            *pos += 1;
+            Ok(())
+        };
         // Use explicit per-frame lengths (code 2 / code 3 VBR) for every
         // sub-frame packet: it is always valid, and avoids the code-3 CBR
         // assumption that all frames are byte-identical in size.
@@ -1757,7 +1754,11 @@ impl OpusDecoder {
         unsafe {
             #[cfg(feature = "heap")]
             {
-                (&raw mut (*this).celt_dec).write(Box::new(CeltDecoder::new(mode, channels, sampling_rate)));
+                (&raw mut (*this).celt_dec).write(Box::new(CeltDecoder::new(
+                    mode,
+                    channels,
+                    sampling_rate,
+                )));
                 (&raw mut (*this).silk_dec).write(Box::new(silk::dec_api::SilkDecoder::new()));
             }
             #[cfg(not(feature = "heap"))]
@@ -1778,26 +1779,58 @@ impl OpusDecoder {
             (&raw mut (*this).hybrid_skip_celt).write(false);
             #[cfg(feature = "heap")]
             {
-                (&raw mut (*this).w_pcm_i16).write(Box::new(FixedVec::from_value(0i16, 960 * channels)));
-                (&raw mut (*this).w_silk_out).write(Box::new(FixedVec::from_value(0.0f32, OPUS_MAX_SUBFRAME * channels)));
-                (&raw mut (*this).w_pcm_resampled).write(Box::new(FixedVec::from_value(0i16, OPUS_MAX_SUBFRAME * channels)));
-                (&raw mut (*this).w_celt_planar).write(Box::new(FixedVec::from_value(0.0f32, OPUS_MAX_SUBFRAME * channels)));
-                (&raw mut (*this).w_celt_out).write(Box::new(FixedVec::from_value(0.0f32, OPUS_MAX_SUBFRAME * channels)));
-                (&raw mut (*this).prev_pcm_tail).write(Box::new(FixedVec::from_value(0.0f32, 240 * channels)));
+                (&raw mut (*this).w_pcm_i16)
+                    .write(Box::new(FixedVec::from_value(0i16, 960 * channels)));
+                (&raw mut (*this).w_silk_out).write(Box::new(FixedVec::from_value(
+                    0.0f32,
+                    OPUS_MAX_SUBFRAME * channels,
+                )));
+                (&raw mut (*this).w_pcm_resampled).write(Box::new(FixedVec::from_value(
+                    0i16,
+                    OPUS_MAX_SUBFRAME * channels,
+                )));
+                (&raw mut (*this).w_celt_planar).write(Box::new(FixedVec::from_value(
+                    0.0f32,
+                    OPUS_MAX_SUBFRAME * channels,
+                )));
+                (&raw mut (*this).w_celt_out).write(Box::new(FixedVec::from_value(
+                    0.0f32,
+                    OPUS_MAX_SUBFRAME * channels,
+                )));
+                (&raw mut (*this).prev_pcm_tail)
+                    .write(Box::new(FixedVec::from_value(0.0f32, 240 * channels)));
             }
             #[cfg(not(feature = "heap"))]
             {
                 FixedVec::write_from_value(&raw mut (*this).w_pcm_i16, 0i16, 960 * channels);
-                FixedVec::write_from_value(&raw mut (*this).w_silk_out, 0.0f32, OPUS_MAX_SUBFRAME * channels);
-                FixedVec::write_from_value(&raw mut (*this).w_pcm_resampled, 0i16, OPUS_MAX_SUBFRAME * channels);
-                FixedVec::write_from_value(&raw mut (*this).w_celt_planar, 0.0f32, OPUS_MAX_SUBFRAME * channels);
-                FixedVec::write_from_value(&raw mut (*this).w_celt_out, 0.0f32, OPUS_MAX_SUBFRAME * channels);
+                FixedVec::write_from_value(
+                    &raw mut (*this).w_silk_out,
+                    0.0f32,
+                    OPUS_MAX_SUBFRAME * channels,
+                );
+                FixedVec::write_from_value(
+                    &raw mut (*this).w_pcm_resampled,
+                    0i16,
+                    OPUS_MAX_SUBFRAME * channels,
+                );
+                FixedVec::write_from_value(
+                    &raw mut (*this).w_celt_planar,
+                    0.0f32,
+                    OPUS_MAX_SUBFRAME * channels,
+                );
+                FixedVec::write_from_value(
+                    &raw mut (*this).w_celt_out,
+                    0.0f32,
+                    OPUS_MAX_SUBFRAME * channels,
+                );
                 FixedVec::write_from_value(&raw mut (*this).prev_pcm_tail, 0.0f32, 240 * channels);
             }
         }
 
         let decoder = unsafe { slot.assume_init_mut() };
-        decoder.silk_dec.init(sampling_rate.min(16000), channels as i32);
+        decoder
+            .silk_dec
+            .init(sampling_rate.min(16000), channels as i32);
         decoder.silk_dec.channel_state[0].fs_api_hz = sampling_rate;
         Ok(decoder)
     }
