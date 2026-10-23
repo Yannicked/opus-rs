@@ -1,6 +1,5 @@
 use crate::range_coder::RangeCoder;
 use crate::scratch::{self, zeroed_prefix};
-use core::mem::MaybeUninit;
 
 #[cfg(not(feature = "std"))]
 use crate::compat::Math;
@@ -518,6 +517,128 @@ fn pvq_search_n2(x: &[f32], y: &mut [i32], k: i32) {
     y[1] = if x[1] >= 0.0 { y1 } else { -y1 };
 }
 
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse2")]
+fn pvq_search_n4_sse2(x: &[f32], y: &mut [i32], k: i32) {
+    use crate::simd::x86::{load4, store4_i32};
+    #[cfg(target_arch = "x86")]
+    use core::arch::x86::*;
+    #[cfg(target_arch = "x86_64")]
+    use core::arch::x86_64::*;
+
+    let sign_mask = _mm_castsi128_ps(_mm_set1_epi32(0x7FFF_FFFFu32 as i32));
+    let vx = load4(x, 0);
+    let vabs = _mm_and_ps(vx, sign_mask);
+
+    let vzero_f = _mm_setzero_ps();
+
+    let vneg_mask = _mm_cmplt_ps(vx, vzero_f);
+
+    let vsigns = _mm_and_si128(_mm_castps_si128(vneg_mask), _mm_set1_epi32(1));
+
+    let vabs_x = vabs;
+    let mut vy2f = _mm_setzero_ps();
+    let mut vy = _mm_setzero_si128();
+    let mut xy = 0.0f32;
+    let mut yy = 0.0f32;
+
+    let vtwo = _mm_set1_ps(2.0);
+
+    let vone_i = _mm_set1_epi32(1);
+
+    let mut pulses_left = k;
+
+    // Pre-search by projecting on the pyramid (C vq_sse2.c: K > N>>1 branch).
+    if k > 2 {
+        // sum of |x|
+        let mut t = _mm_add_ps(vabs, _mm_shuffle_ps(vabs, vabs, 0b01001110));
+        t = _mm_add_ps(t, _mm_shuffle_ps(t, t, 0b10110001));
+        let sum = _mm_cvtss_f32(t);
+        // C: if X too small, just replace it with a pulse at 0
+        let sum = if !(sum > 1e-15 && sum < 64.0) {
+            1.0
+        } else {
+            sum
+        };
+        // C uses the _mm_rcp_ps approximation (not exact division)
+        let vrcp = _mm_mul_ps(_mm_set1_ps(k as f32 + 0.8), _mm_rcp_ps(_mm_set1_ps(sum)));
+        let vyi = _mm_cvttps_epi32(_mm_mul_ps(vabs_x, vrcp));
+        vy = vyi;
+        let vyi_f = _mm_cvtepi32_ps(vyi);
+        let vy2 = _mm_add_ps(vyi_f, vyi_f);
+        vy2f = vy2;
+        // xy = dot(x, iy), yy = dot(iy, iy)
+        let vxy4 = _mm_mul_ps(vabs_x, vyi_f);
+        let vyy4 = _mm_mul_ps(vyi_f, vyi_f);
+        let mut t = _mm_add_ps(vxy4, _mm_shuffle_ps(vxy4, vxy4, 0b01001110));
+        t = _mm_add_ps(t, _mm_shuffle_ps(t, t, 0b10110001));
+        xy = _mm_cvtss_f32(t);
+        let mut t = _mm_add_ps(vyy4, _mm_shuffle_ps(vyy4, vyy4, 0b01001110));
+        t = _mm_add_ps(t, _mm_shuffle_ps(t, t, 0b10110001));
+        yy = _mm_cvtss_f32(t);
+        // pulses_left -= sum(iy)
+        let mut ps = _mm_add_epi32(vyi, _mm_shuffle_epi32(vyi, 0b01001110));
+        ps = _mm_add_epi32(ps, _mm_shuffle_epi32(ps, 0b10110001));
+        pulses_left -= _mm_cvtsi128_si32(ps);
+    }
+
+    for _ in 0..pulses_left {
+        let vxy = _mm_set1_ps(xy);
+        let vrxy = _mm_add_ps(vabs_x, vxy);
+        let vyy1 = _mm_add_ps(vy2f, _mm_set1_ps(yy + 1.0));
+
+        let vscore = _mm_mul_ps(vrxy, _mm_rsqrt_ps(vyy1));
+
+        let s0 = _mm_cvtss_f32(vscore);
+        let s1 = _mm_cvtss_f32(_mm_shuffle_ps(vscore, vscore, 0b01_01_01_01));
+        let s2 = _mm_cvtss_f32(_mm_shuffle_ps(vscore, vscore, 0b10_10_10_10));
+        let s3 = _mm_cvtss_f32(_mm_shuffle_ps(vscore, vscore, 0b11_11_11_11));
+        let mut best_score = s0;
+        let mut best_i: u32 = 0;
+        // C SSE2 keeps the HIGHEST index on ties (pos = max of matching lanes).
+        if s1 >= best_score {
+            best_score = s1;
+            best_i = 1;
+        }
+        if s2 >= best_score {
+            best_score = s2;
+            best_i = 2;
+        }
+        if s3 >= best_score {
+            best_i = 3;
+        }
+        let _ = best_score;
+
+        let vbest = _mm_set1_epi32(best_i as i32);
+        let vlane = _mm_setr_epi32(0, 1, 2, 3);
+        let vmask = _mm_castsi128_ps(_mm_cmpeq_epi32(vlane, vbest));
+
+        let vpick_ax = _mm_and_ps(vabs_x, vmask);
+
+        let vpick_ax_hi = _mm_movehl_ps(vpick_ax, vpick_ax);
+        let vpick_ax2 = _mm_add_ps(vpick_ax, vpick_ax_hi);
+        let vpick_ax3 = _mm_add_ss(vpick_ax2, _mm_shuffle_ps(vpick_ax2, vpick_ax2, 1));
+        xy += _mm_cvtss_f32(vpick_ax3);
+
+        let vpick_ryy = _mm_and_ps(vyy1, vmask);
+        let vpick_ryy_hi = _mm_movehl_ps(vpick_ryy, vpick_ryy);
+        let vpick_ryy2 = _mm_add_ps(vpick_ryy, vpick_ryy_hi);
+        let vpick_ryy3 = _mm_add_ss(vpick_ryy2, _mm_shuffle_ps(vpick_ryy2, vpick_ryy2, 1));
+        yy = _mm_cvtss_f32(vpick_ryy3);
+
+        let vadd2 = _mm_and_ps(vtwo, vmask);
+        vy2f = _mm_add_ps(vy2f, vadd2);
+
+        let vadd1 = _mm_and_si128(vone_i, _mm_castps_si128(vmask));
+        vy = _mm_add_epi32(vy, vadd1);
+    }
+
+    let vneg_s = _mm_sub_epi32(_mm_setzero_si128(), vsigns);
+    let vy_xor = _mm_xor_si128(vy, vneg_s);
+    let vy_out = _mm_add_epi32(vy_xor, vsigns);
+    store4_i32(y, 0, vy_out);
+}
+
 #[inline]
 fn pvq_search_n4(x: &[f32], y: &mut [i32], k: i32) {
     debug_assert!(x.len() >= 4 && y.len() >= 4);
@@ -531,123 +652,10 @@ fn pvq_search_n4(x: &[f32], y: &mut [i32], k: i32) {
     }
 
     #[cfg(target_arch = "x86_64")]
-    unsafe {
-        #[cfg(target_arch = "x86")]
-        use core::arch::x86::*;
-        #[cfg(target_arch = "x86_64")]
-        use core::arch::x86_64::*;
-
-        let sign_mask = _mm_castsi128_ps(_mm_set1_epi32(0x7FFF_FFFFu32 as i32));
-        let vx = _mm_loadu_ps(x.as_ptr());
-        let vabs = _mm_and_ps(vx, sign_mask);
-
-        let vzero_f = _mm_setzero_ps();
-
-        let vneg_mask = _mm_cmplt_ps(vx, vzero_f);
-
-        let vsigns = _mm_and_si128(_mm_castps_si128(vneg_mask), _mm_set1_epi32(1));
-
-        let vabs_x = vabs;
-        let mut vy2f = _mm_setzero_ps();
-        let mut vy = _mm_setzero_si128();
-        let mut xy = 0.0f32;
-        let mut yy = 0.0f32;
-
-        let vtwo = _mm_set1_ps(2.0);
-
-        let vone_i = _mm_set1_epi32(1);
-
-        let mut pulses_left = k;
-
-        // Pre-search by projecting on the pyramid (C vq_sse2.c: K > N>>1 branch).
-        if k > 2 {
-            // sum of |x|
-            let mut t = _mm_add_ps(vabs, _mm_shuffle_ps(vabs, vabs, 0b01001110));
-            t = _mm_add_ps(t, _mm_shuffle_ps(t, t, 0b10110001));
-            let sum = _mm_cvtss_f32(t);
-            // C: if X too small, just replace it with a pulse at 0
-            let sum = if !(sum > 1e-15 && sum < 64.0) {
-                1.0
-            } else {
-                sum
-            };
-            // C uses the _mm_rcp_ps approximation (not exact division)
-            let vrcp = _mm_mul_ps(_mm_set1_ps(k as f32 + 0.8), _mm_rcp_ps(_mm_set1_ps(sum)));
-            let vyi = _mm_cvttps_epi32(_mm_mul_ps(vabs_x, vrcp));
-            vy = vyi;
-            let vyi_f = _mm_cvtepi32_ps(vyi);
-            let vy2 = _mm_add_ps(vyi_f, vyi_f);
-            vy2f = vy2;
-            // xy = dot(x, iy), yy = dot(iy, iy)
-            let vxy4 = _mm_mul_ps(vabs_x, vyi_f);
-            let vyy4 = _mm_mul_ps(vyi_f, vyi_f);
-            let mut t = _mm_add_ps(vxy4, _mm_shuffle_ps(vxy4, vxy4, 0b01001110));
-            t = _mm_add_ps(t, _mm_shuffle_ps(t, t, 0b10110001));
-            xy = _mm_cvtss_f32(t);
-            let mut t = _mm_add_ps(vyy4, _mm_shuffle_ps(vyy4, vyy4, 0b01001110));
-            t = _mm_add_ps(t, _mm_shuffle_ps(t, t, 0b10110001));
-            yy = _mm_cvtss_f32(t);
-            // pulses_left -= sum(iy)
-            let mut ps = _mm_add_epi32(vyi, _mm_shuffle_epi32(vyi, 0b01001110));
-            ps = _mm_add_epi32(ps, _mm_shuffle_epi32(ps, 0b10110001));
-            pulses_left -= _mm_cvtsi128_si32(ps);
-        }
-
-        for _ in 0..pulses_left {
-            let vxy = _mm_set1_ps(xy);
-            let vrxy = _mm_add_ps(vabs_x, vxy);
-            let vyy1 = _mm_add_ps(vy2f, _mm_set1_ps(yy + 1.0));
-
-            let vscore = _mm_mul_ps(vrxy, _mm_rsqrt_ps(vyy1));
-
-            let s0 = _mm_cvtss_f32(vscore);
-            let s1 = _mm_cvtss_f32(_mm_shuffle_ps(vscore, vscore, 0b01_01_01_01));
-            let s2 = _mm_cvtss_f32(_mm_shuffle_ps(vscore, vscore, 0b10_10_10_10));
-            let s3 = _mm_cvtss_f32(_mm_shuffle_ps(vscore, vscore, 0b11_11_11_11));
-            let mut best_score = s0;
-            let mut best_i: u32 = 0;
-            // C SSE2 keeps the HIGHEST index on ties (pos = max of matching lanes).
-            if s1 >= best_score {
-                best_score = s1;
-                best_i = 1;
-            }
-            if s2 >= best_score {
-                best_score = s2;
-                best_i = 2;
-            }
-            if s3 >= best_score {
-                best_i = 3;
-            }
-            let _ = best_score;
-
-            let vbest = _mm_set1_epi32(best_i as i32);
-            let vlane = _mm_setr_epi32(0, 1, 2, 3);
-            let vmask = _mm_castsi128_ps(_mm_cmpeq_epi32(vlane, vbest));
-
-            let vpick_ax = _mm_and_ps(vabs_x, vmask);
-
-            let vpick_ax_hi = _mm_movehl_ps(vpick_ax, vpick_ax);
-            let vpick_ax2 = _mm_add_ps(vpick_ax, vpick_ax_hi);
-            let vpick_ax3 = _mm_add_ss(vpick_ax2, _mm_shuffle_ps(vpick_ax2, vpick_ax2, 1));
-            xy += _mm_cvtss_f32(vpick_ax3);
-
-            let vpick_ryy = _mm_and_ps(vyy1, vmask);
-            let vpick_ryy_hi = _mm_movehl_ps(vpick_ryy, vpick_ryy);
-            let vpick_ryy2 = _mm_add_ps(vpick_ryy, vpick_ryy_hi);
-            let vpick_ryy3 = _mm_add_ss(vpick_ryy2, _mm_shuffle_ps(vpick_ryy2, vpick_ryy2, 1));
-            yy = _mm_cvtss_f32(vpick_ryy3);
-
-            let vadd2 = _mm_and_ps(vtwo, vmask);
-            vy2f = _mm_add_ps(vy2f, vadd2);
-
-            let vadd1 = _mm_and_si128(vone_i, _mm_castps_si128(vmask));
-            vy = _mm_add_epi32(vy, vadd1);
-        }
-
-        let vneg_s = _mm_sub_epi32(_mm_setzero_si128(), vsigns);
-        let vy_xor = _mm_xor_si128(vy, vneg_s);
-        let vy_out = _mm_add_epi32(vy_xor, vsigns);
-        _mm_storeu_si128(y.as_mut_ptr() as *mut __m128i, vy_out);
+    {
+        // SAFETY: SSE2 is part of the x86_64 baseline, so every x86_64 CPU
+        // has it.
+        unsafe { pvq_search_n4_sse2(x, y, k) };
     }
 
     #[cfg(not(target_arch = "x86_64"))]
@@ -782,15 +790,15 @@ pub fn pvq_search(x: &[f32], y: &mut [i32], k: i32, n: usize) {
 
     #[cfg(target_arch = "aarch64")]
     if n <= 16 {
-        pvq_search_neon(x, y, k, n);
+        // SAFETY: NEON is part of the aarch64 baseline.
+        unsafe { pvq_search_neon(x, y, k, n) };
         return;
     }
 
     #[cfg(target_arch = "x86_64")]
     if k > 4 && crate::compat::x86_has_avx2_fma() {
-        unsafe {
-            pvq_search_avx2(x, y, k, n);
-        }
+        // SAFETY: the CPU supports AVX2 and FMA, checked just above.
+        unsafe { pvq_search_avx2(x, y, k, n) };
         return;
     }
 
@@ -798,34 +806,32 @@ pub fn pvq_search(x: &[f32], y: &mut [i32], k: i32, n: usize) {
 }
 
 #[cfg(target_arch = "aarch64")]
-#[inline(always)]
-#[allow(unsafe_op_in_unsafe_fn)]
-unsafe fn pvq_fast_select_init_neon(
-    x: &[f32],
-    n: usize,
-    abs_x: &mut [MaybeUninit<f32>; MAX_PVQ_N],
-    signs: &mut [MaybeUninit<i32>; MAX_PVQ_N],
-) -> f32 {
+#[inline]
+#[target_feature(enable = "neon")]
+fn pvq_fast_select_init_neon(x: &[f32], n: usize, abs_x: &mut [f32], signs: &mut [i32]) -> f32 {
+    use crate::simd::neon::{ld4, st4};
     use core::arch::aarch64::*;
+
+    let x = &x[..n];
 
     let mut sum_vec = vdupq_n_f32(0.0);
     let mut i = 0;
 
     while i + 16 <= n {
-        let vx0 = vld1q_f32(x.as_ptr().add(i));
-        let vx1 = vld1q_f32(x.as_ptr().add(i + 4));
-        let vx2 = vld1q_f32(x.as_ptr().add(i + 8));
-        let vx3 = vld1q_f32(x.as_ptr().add(i + 12));
+        let vx0 = ld4(x, i);
+        let vx1 = ld4(x, i + 4);
+        let vx2 = ld4(x, i + 8);
+        let vx3 = ld4(x, i + 12);
 
         let vabs0 = vabsq_f32(vx0);
         let vabs1 = vabsq_f32(vx1);
         let vabs2 = vabsq_f32(vx2);
         let vabs3 = vabsq_f32(vx3);
 
-        vst1q_f32(abs_x.as_mut_ptr().add(i) as *mut f32, vabs0);
-        vst1q_f32(abs_x.as_mut_ptr().add(i + 4) as *mut f32, vabs1);
-        vst1q_f32(abs_x.as_mut_ptr().add(i + 8) as *mut f32, vabs2);
-        vst1q_f32(abs_x.as_mut_ptr().add(i + 12) as *mut f32, vabs3);
+        st4(abs_x, i, vabs0);
+        st4(abs_x, i + 4, vabs1);
+        st4(abs_x, i + 8, vabs2);
+        st4(abs_x, i + 12, vabs3);
 
         sum_vec = vaddq_f32(sum_vec, vabs0);
         sum_vec = vaddq_f32(sum_vec, vabs1);
@@ -833,40 +839,40 @@ unsafe fn pvq_fast_select_init_neon(
         sum_vec = vaddq_f32(sum_vec, vabs3);
 
         for j in 0..16 {
-            signs[i + j].write(if x[i + j] < 0.0 { -1i32 } else { 1i32 });
+            signs[i + j] = if x[i + j] < 0.0 { -1i32 } else { 1i32 };
         }
 
         i += 16;
     }
 
     while i + 8 <= n {
-        let vx0 = vld1q_f32(x.as_ptr().add(i));
-        let vx1 = vld1q_f32(x.as_ptr().add(i + 4));
+        let vx0 = ld4(x, i);
+        let vx1 = ld4(x, i + 4);
 
         let vabs0 = vabsq_f32(vx0);
         let vabs1 = vabsq_f32(vx1);
 
-        vst1q_f32(abs_x.as_mut_ptr().add(i) as *mut f32, vabs0);
-        vst1q_f32(abs_x.as_mut_ptr().add(i + 4) as *mut f32, vabs1);
+        st4(abs_x, i, vabs0);
+        st4(abs_x, i + 4, vabs1);
 
         sum_vec = vaddq_f32(sum_vec, vabs0);
         sum_vec = vaddq_f32(sum_vec, vabs1);
 
         for j in 0..8 {
-            signs[i + j].write(if x[i + j] < 0.0 { -1i32 } else { 1i32 });
+            signs[i + j] = if x[i + j] < 0.0 { -1i32 } else { 1i32 };
         }
 
         i += 8;
     }
 
     while i + 4 <= n {
-        let vx = vld1q_f32(x.as_ptr().add(i));
+        let vx = ld4(x, i);
         let vabs = vabsq_f32(vx);
-        vst1q_f32(abs_x.as_mut_ptr().add(i) as *mut f32, vabs);
+        st4(abs_x, i, vabs);
         sum_vec = vaddq_f32(sum_vec, vabs);
 
         for j in 0..4 {
-            signs[i + j].write(if x[i + j] < 0.0 { -1i32 } else { 1i32 });
+            signs[i + j] = if x[i + j] < 0.0 { -1i32 } else { 1i32 };
         }
 
         i += 4;
@@ -876,67 +882,135 @@ unsafe fn pvq_fast_select_init_neon(
 
     for j in i..n {
         let abs_xi = x[j].abs();
-        abs_x[j].write(abs_xi);
+        abs_x[j] = abs_xi;
         sum += abs_xi;
-        signs[j].write(if x[j] < 0.0 { -1i32 } else { 1i32 });
+        signs[j] = if x[j] < 0.0 { -1i32 } else { 1i32 };
     }
 
     sum
 }
 
+/// The pulse-at-a-time tail of [`pvq_search_fast_select`] on aarch64.
+/// Returns the updated `yy`.
+#[cfg(target_arch = "aarch64")]
+#[inline]
+#[target_feature(enable = "neon")]
+fn fast_select_pulses_neon(
+    abs_x: &[f32],
+    y: &mut [i32],
+    n: usize,
+    mut k: i32,
+    mut xy: f32,
+    mut yy: f32,
+) -> f32 {
+    use crate::simd::neon::{ld4, st4};
+    use core::arch::aarch64::*;
+    let mut y2f_buf = scratch::uninit::<f32, MAX_PVQ_N>();
+    let y2f = zeroed_prefix(&mut y2f_buf, n);
+    for i in 0..n {
+        y2f[i] = 2.0 * y[i] as f32;
+    }
+
+    let n4 = n & !3;
+    while k > 0 {
+        yy += 1.0;
+        let vxy = vdupq_n_f32(xy);
+        let vyy = vdupq_n_f32(yy);
+        let mut vmax = vdupq_n_f32(0.0);
+        let mut best_id: usize = 0;
+
+        let mut i = 0;
+        while i < n4 {
+            let vx = ld4(abs_x, i);
+            let vy = ld4(y2f, i);
+            let rxy = vaddq_f32(vx, vxy);
+            let ryy = vaddq_f32(vy, vyy);
+            let inv_sqrt = vrsqrteq_f32(ryy);
+            let score = vmulq_f32(rxy, inv_sqrt);
+            vmax = vmaxq_f32(vmax, score);
+            let mut sc = [0.0f32; 4];
+            st4(&mut sc, 0, score);
+            let mx = vmaxvq_f32(vmax);
+            for lane in 0..4 {
+                if sc[lane] == mx {
+                    best_id = i + lane;
+                }
+            }
+            i += 4;
+        }
+
+        while i < n {
+            let rxy = xy + abs_x[i];
+            let ryy = yy + y2f[i];
+            let score = rxy * (1.0 / ryy.sqrt());
+            let current_max = vmaxvq_f32(vmax);
+            if score > current_max {
+                best_id = i;
+                vmax = vsetq_lane_f32(score, vmax, 0);
+            }
+            i += 1;
+        }
+
+        xy += abs_x[best_id];
+        yy += y2f[best_id];
+        y2f[best_id] += 2.0;
+        y[best_id] += 1;
+        k -= 1;
+    }
+    yy
+}
+
 #[inline]
 pub fn pvq_search_fast_select(x: &[f32], y: &mut [i32], k: i32, n: usize) -> f32 {
+    let x = &x[..n];
+    let y = &mut y[..n];
     let mut k = k;
     let mut yy = 0.0f32;
     let mut xy = 0.0f32;
 
-    y[..n].fill(0);
+    y.fill(0);
 
     if k <= 0 {
         return 0.0;
     }
 
-    let mut abs_x_mu = [MaybeUninit::<f32>::uninit(); MAX_PVQ_N];
-    let mut signs_mu = [MaybeUninit::<i32>::uninit(); MAX_PVQ_N];
+    let mut abs_x_buf = scratch::uninit::<f32, MAX_PVQ_N>();
+    let mut signs_buf = scratch::uninit::<i32, MAX_PVQ_N>();
+    let abs_x = zeroed_prefix(&mut abs_x_buf, n);
+    let signs = zeroed_prefix(&mut signs_buf, n);
 
     #[cfg(target_arch = "aarch64")]
-    let sum = unsafe { pvq_fast_select_init_neon(x, n, &mut abs_x_mu, &mut signs_mu) };
+    // SAFETY: NEON is part of the aarch64 baseline.
+    let sum = unsafe { pvq_fast_select_init_neon(x, n, abs_x, signs) };
     #[cfg(not(target_arch = "aarch64"))]
     let sum = {
         let mut s = 0.0f32;
         for i in 0..n {
-            abs_x_mu[i].write(x[i].abs());
-            signs_mu[i].write(if x[i] < 0.0 { -1i32 } else { 1i32 });
-            s += unsafe { abs_x_mu[i].assume_init() };
+            abs_x[i] = x[i].abs();
+            signs[i] = if x[i] < 0.0 { -1i32 } else { 1i32 };
+            s += abs_x[i];
         }
         s
     };
-
-    let abs_x = unsafe { core::slice::from_raw_parts(abs_x_mu.as_ptr() as *const f32, n) };
-    let signs = unsafe { core::slice::from_raw_parts(signs_mu.as_ptr() as *const i32, n) };
+    let abs_x = &*abs_x;
+    let signs = &*signs;
 
     if k > (n >> 1) as i32 && sum > 1e-15 {
         let rcp = (k as f32 + 0.8) / sum;
 
-        let abs_x_ptr = abs_x.as_ptr();
-        let y_ptr = y.as_mut_ptr();
-        unsafe {
-            for i in 0..n {
-                let yi = (*abs_x_ptr.add(i) * rcp) as i32;
-                *y_ptr.add(i) = yi;
-                let yf = yi as f32;
-                yy += yf * yf;
-                xy += yf * *abs_x_ptr.add(i);
-                k -= yi;
-            }
+        for i in 0..n {
+            let yi = (abs_x[i] * rcp) as i32;
+            y[i] = yi;
+            let yf = yi as f32;
+            yy += yf * yf;
+            xy += yf * abs_x[i];
+            k -= yi;
         }
 
         if k > n as i32 + 3 {
             let tmp = k as f32;
-            unsafe {
-                yy += tmp * tmp + tmp * *y_ptr as f32;
-                *y_ptr += k;
-            }
+            yy += tmp * tmp + tmp * y[0] as f32;
+            y[0] += k;
             k = 0;
         }
     }
@@ -946,148 +1020,71 @@ pub fn pvq_search_fast_select(x: &[f32], y: &mut [i32], k: i32, n: usize) -> f32
     if k < BATCH_SIZE * 2 || n < 16 {
         #[cfg(target_arch = "aarch64")]
         {
-            use core::arch::aarch64::*;
-            let mut y2f_mu = [MaybeUninit::<f32>::uninit(); MAX_PVQ_N];
-            for i in 0..n {
-                y2f_mu[i].write(2.0 * y[i] as f32);
-            }
-            let y2f = unsafe {
-                core::slice::from_raw_parts_mut(y2f_mu.as_mut_ptr() as *mut f32, MAX_PVQ_N)
-            };
-
-            let abs_x_ptr = abs_x.as_ptr();
-            let y2f_ptr = y2f.as_mut_ptr();
-            let y_ptr = y.as_mut_ptr();
-            unsafe {
-                let n4 = n & !3;
-                while k > 0 {
-                    yy += 1.0;
-                    let vxy = vdupq_n_f32(xy);
-                    let vyy = vdupq_n_f32(yy);
-                    let mut vmax = vdupq_n_f32(0.0);
-                    let mut best_id: usize = 0;
-
-                    let mut i = 0;
-                    while i < n4 {
-                        let vx = vld1q_f32(abs_x_ptr.add(i));
-                        let vy = vld1q_f32(y2f_ptr.add(i));
-                        let rxy = vaddq_f32(vx, vxy);
-                        let ryy = vaddq_f32(vy, vyy);
-                        let inv_sqrt = vrsqrteq_f32(ryy);
-                        let score = vmulq_f32(rxy, inv_sqrt);
-                        vmax = vmaxq_f32(vmax, score);
-                        let sc = core::slice::from_raw_parts(
-                            &score as *const float32x4_t as *const f32,
-                            4,
-                        );
-                        let mx = vmaxvq_f32(vmax);
-                        for lane in 0..4 {
-                            if sc[lane] == mx {
-                                best_id = i + lane;
-                            }
-                        }
-                        i += 4;
-                    }
-
-                    while i < n {
-                        let rxy = xy + *abs_x_ptr.add(i);
-                        let ryy = yy + *y2f_ptr.add(i);
-                        let score = rxy * (1.0 / ryy.sqrt());
-                        let current_max = vmaxvq_f32(vmax);
-                        if score > current_max {
-                            best_id = i;
-                            vmax = vsetq_lane_f32(score, vmax, 0);
-                        }
-                        i += 1;
-                    }
-
-                    xy += *abs_x_ptr.add(best_id);
-                    yy += *y2f_ptr.add(best_id);
-                    *y2f_ptr.add(best_id) += 2.0;
-                    *y_ptr.add(best_id) += 1;
-                    k -= 1;
-                }
-            }
+            // SAFETY: NEON is part of the aarch64 baseline.
+            yy = unsafe { fast_select_pulses_neon(abs_x, y, n, k, xy, yy) };
         }
         #[cfg(not(target_arch = "aarch64"))]
         {
             let mut y2f = [0.0f32; MAX_PVQ_N];
-            let abs_x_ptr = abs_x.as_ptr();
-            let y2f_ptr = y2f.as_mut_ptr();
-            let y_ptr = y.as_mut_ptr();
-            unsafe {
-                while k > 0 {
-                    yy += 1.0;
-                    let rxy0 = xy + *abs_x_ptr;
-                    let mut best_id = 0;
-                    let mut best_num = rxy0 * rxy0;
-                    let mut best_den = yy + *y2f_ptr;
-                    let mut i = 1;
-                    while i + 1 < n {
-                        let rxy1 = xy + *abs_x_ptr.add(i);
-                        let ryy1 = yy + *y2f_ptr.add(i);
-                        let rxy1_sq = rxy1 * rxy1;
-                        if best_den * rxy1_sq > ryy1 * best_num {
-                            best_id = i;
-                            best_num = rxy1_sq;
-                            best_den = ryy1;
-                        }
-                        let rxy2 = xy + *abs_x_ptr.add(i + 1);
-                        let ryy2 = yy + *y2f_ptr.add(i + 1);
-                        let rxy2_sq = rxy2 * rxy2;
-                        if best_den * rxy2_sq > ryy2 * best_num {
-                            best_id = i + 1;
-                            best_num = rxy2_sq;
-                            best_den = ryy2;
-                        }
-                        i += 2;
+            while k > 0 {
+                yy += 1.0;
+                let rxy0 = xy + abs_x[0];
+                let mut best_id = 0;
+                let mut best_num = rxy0 * rxy0;
+                let mut best_den = yy + y2f[0];
+                let mut i = 1;
+                while i + 1 < n {
+                    let rxy1 = xy + abs_x[i];
+                    let ryy1 = yy + y2f[i];
+                    let rxy1_sq = rxy1 * rxy1;
+                    if best_den * rxy1_sq > ryy1 * best_num {
+                        best_id = i;
+                        best_num = rxy1_sq;
+                        best_den = ryy1;
                     }
-                    if i < n {
-                        let rxy = xy + *abs_x_ptr.add(i);
-                        let ryy = yy + *y2f_ptr.add(i);
-                        let rxy_sq = rxy * rxy;
-                        if best_den * rxy_sq > ryy * best_num {
-                            best_id = i;
-                        }
+                    let rxy2 = xy + abs_x[i + 1];
+                    let ryy2 = yy + y2f[i + 1];
+                    let rxy2_sq = rxy2 * rxy2;
+                    if best_den * rxy2_sq > ryy2 * best_num {
+                        best_id = i + 1;
+                        best_num = rxy2_sq;
+                        best_den = ryy2;
                     }
-                    xy += *abs_x_ptr.add(best_id);
-                    yy += *y2f_ptr.add(best_id);
-                    *y2f_ptr.add(best_id) += 2.0;
-                    *y_ptr.add(best_id) += 1;
-                    k -= 1;
+                    i += 2;
                 }
+                if i < n {
+                    let rxy = xy + abs_x[i];
+                    let ryy = yy + y2f[i];
+                    let rxy_sq = rxy * rxy;
+                    if best_den * rxy_sq > ryy * best_num {
+                        best_id = i;
+                    }
+                }
+                xy += abs_x[best_id];
+                yy += y2f[best_id];
+                y2f[best_id] += 2.0;
+                y[best_id] += 1;
+                k -= 1;
             }
         }
     } else {
-        let mut y2f_mu = [MaybeUninit::<f32>::uninit(); MAX_PVQ_N];
-
-        let y_ptr = y.as_mut_ptr();
+        let mut y2f_buf = scratch::uninit::<f32, MAX_PVQ_N>();
+        let y2f = zeroed_prefix(&mut y2f_buf, n);
         for i in 0..n {
-            unsafe {
-                y2f_mu[i].write(2.0 * *y_ptr.add(i) as f32);
-            }
+            y2f[i] = 2.0 * y[i] as f32;
         }
-        let y2f =
-            unsafe { core::slice::from_raw_parts_mut(y2f_mu.as_mut_ptr() as *mut f32, MAX_PVQ_N) };
-        let mut scores_mu = [MaybeUninit::<(f32, usize)>::uninit(); MAX_PVQ_N];
+        let mut scores_buf = scratch::uninit::<(f32, usize), MAX_PVQ_N>();
+        let scores = zeroed_prefix(&mut scores_buf, n);
 
-        let abs_x_ptr = abs_x.as_ptr();
-        let y2f_ptr = y2f.as_mut_ptr();
         while k > 0 {
             let batch = BATCH_SIZE.min(k);
 
-            unsafe {
-                for i in 0..n {
-                    let rxy = xy + *abs_x_ptr.add(i);
-                    let ryy = yy + *y2f_ptr.add(i) + 1.0;
-                    let score = rxy * rxy / ryy;
-                    scores_mu[i].write((score, i));
-                }
+            for i in 0..n {
+                let rxy = xy + abs_x[i];
+                let ryy = yy + y2f[i] + 1.0;
+                let score = rxy * rxy / ryy;
+                scores[i] = (score, i);
             }
-
-            let scores = unsafe {
-                core::slice::from_raw_parts_mut(scores_mu.as_mut_ptr() as *mut (f32, usize), n)
-            };
 
             let pos = batch as usize;
 
@@ -1101,59 +1098,57 @@ pub fn pvq_search_fast_select(x: &[f32], y: &mut [i32], k: i32, n: usize) -> f32
                 }
             });
 
-            unsafe {
-                for b in 0..batch as usize {
-                    let idx = scores[b].1;
-                    xy += *abs_x_ptr.add(idx);
-                    yy += *y2f_ptr.add(idx) + 1.0;
-                    *y2f_ptr.add(idx) += 2.0;
-                    *y_ptr.add(idx) += 1;
-                }
+            for b in 0..batch as usize {
+                let idx = scores[b].1;
+                xy += abs_x[idx];
+                yy += y2f[idx] + 1.0;
+                y2f[idx] += 2.0;
+                y[idx] += 1;
             }
 
             k -= batch;
         }
     }
 
-    unsafe {
-        let y_ptr = y.as_mut_ptr();
-        for i in 0..n {
-            *y_ptr.add(i) *= *signs.as_ptr().add(i);
-        }
+    for i in 0..n {
+        y[i] *= signs[i];
     }
 
     yy
 }
 
 #[cfg(target_arch = "aarch64")]
-#[inline(always)]
-#[allow(unsafe_op_in_unsafe_fn)]
-unsafe fn pvq_search_scalar_init_neon(
+#[inline]
+#[target_feature(enable = "neon")]
+fn pvq_search_scalar_init_neon(
     x: &[f32],
     n: usize,
     abs_x: &mut [f32; 32],
     sign_x: &mut [i32; 32],
 ) -> f32 {
+    use crate::simd::neon::{ld4, st4};
     use core::arch::aarch64::*;
+
+    let x = &x[..n];
 
     let mut sum_vec = vdupq_n_f32(0.0);
     let mut i = 0;
 
     while i + 16 <= n {
-        let vx0 = vld1q_f32(x.as_ptr().add(i));
-        let vx1 = vld1q_f32(x.as_ptr().add(i + 4));
-        let vx2 = vld1q_f32(x.as_ptr().add(i + 8));
-        let vx3 = vld1q_f32(x.as_ptr().add(i + 12));
+        let vx0 = ld4(x, i);
+        let vx1 = ld4(x, i + 4);
+        let vx2 = ld4(x, i + 8);
+        let vx3 = ld4(x, i + 12);
 
         let vabs0 = vabsq_f32(vx0);
         let vabs1 = vabsq_f32(vx1);
         let vabs2 = vabsq_f32(vx2);
         let vabs3 = vabsq_f32(vx3);
 
-        vst1q_f32(abs_x.as_mut_ptr().add(i), vabs0);
-        vst1q_f32(abs_x.as_mut_ptr().add(i + 4), vabs1);
-        vst1q_f32(abs_x.as_mut_ptr().add(i + 8), vabs2);
-        vst1q_f32(abs_x.as_mut_ptr().add(i + 12), vabs3);
+        st4(abs_x, i, vabs0);
+        st4(abs_x, i + 4, vabs1);
+        st4(abs_x, i + 8, vabs2);
+        st4(abs_x, i + 12, vabs3);
 
         sum_vec = vaddq_f32(sum_vec, vabs0);
         sum_vec = vaddq_f32(sum_vec, vabs1);
@@ -1168,14 +1163,14 @@ unsafe fn pvq_search_scalar_init_neon(
     }
 
     while i + 8 <= n {
-        let vx0 = vld1q_f32(x.as_ptr().add(i));
-        let vx1 = vld1q_f32(x.as_ptr().add(i + 4));
+        let vx0 = ld4(x, i);
+        let vx1 = ld4(x, i + 4);
 
         let vabs0 = vabsq_f32(vx0);
         let vabs1 = vabsq_f32(vx1);
 
-        vst1q_f32(abs_x.as_mut_ptr().add(i), vabs0);
-        vst1q_f32(abs_x.as_mut_ptr().add(i + 4), vabs1);
+        st4(abs_x, i, vabs0);
+        st4(abs_x, i + 4, vabs1);
 
         sum_vec = vaddq_f32(sum_vec, vabs0);
         sum_vec = vaddq_f32(sum_vec, vabs1);
@@ -1188,9 +1183,9 @@ unsafe fn pvq_search_scalar_init_neon(
     }
 
     while i + 4 <= n {
-        let vx = vld1q_f32(x.as_ptr().add(i));
+        let vx = ld4(x, i);
         let vabs = vabsq_f32(vx);
-        vst1q_f32(abs_x.as_mut_ptr().add(i), vabs);
+        st4(abs_x, i, vabs);
         sum_vec = vaddq_f32(sum_vec, vabs);
 
         for j in 0..4 {
@@ -1217,86 +1212,76 @@ unsafe fn pvq_search_scalar_init_neon(
 fn pvq_search_small_k(x: &[f32], y: &mut [i32], k: i32, n: usize) {
     debug_assert!(k <= 4 && k > 0);
     debug_assert!(n <= 31);
+    let x = &x[..n];
+    let y = &mut y[..n];
 
     let mut abs_x = [0.0f32; 32];
     let mut y2f = [0.0f32; 32];
     let mut sign_x = [0i32; 32];
 
-    unsafe {
-        let x_ptr = x.as_ptr();
-        let abs_x_ptr = abs_x.as_mut_ptr();
-        let sign_ptr = sign_x.as_mut_ptr();
-        for i in 0..n {
-            let xi = *x_ptr.add(i);
-            *abs_x_ptr.add(i) = xi.abs();
-            *sign_ptr.add(i) = (xi < 0.0) as i32;
-        }
+    for i in 0..n {
+        let xi = x[i];
+        abs_x[i] = xi.abs();
+        sign_x[i] = (xi < 0.0) as i32;
     }
 
     let mut yy = 0.0f32;
     let mut xy = 0.0f32;
 
-    let abs_x_ptr = abs_x.as_ptr();
-    let y2f_ptr = y2f.as_mut_ptr();
-    let y_ptr = y.as_mut_ptr();
-    unsafe {
-        for _ in 0..k {
-            yy += 1.0;
+    for _ in 0..k {
+        yy += 1.0;
 
-            let rxy0 = xy + *abs_x_ptr;
-            let mut best_id = 0usize;
-            let mut best_num = rxy0 * rxy0;
-            let mut best_den = yy + *y2f_ptr;
+        let rxy0 = xy + abs_x[0];
+        let mut best_id = 0usize;
+        let mut best_num = rxy0 * rxy0;
+        let mut best_den = yy + y2f[0];
 
-            let mut i = 1;
-            while i + 1 < n {
-                let rxy1 = xy + *abs_x_ptr.add(i);
-                let rxy2 = xy + *abs_x_ptr.add(i + 1);
-                let den1 = yy + *y2f_ptr.add(i);
-                let den2 = yy + *y2f_ptr.add(i + 1);
-                let rxy1_sq = rxy1 * rxy1;
-                let rxy2_sq = rxy2 * rxy2;
+        let mut i = 1;
+        while i + 1 < n {
+            let rxy1 = xy + abs_x[i];
+            let rxy2 = xy + abs_x[i + 1];
+            let den1 = yy + y2f[i];
+            let den2 = yy + y2f[i + 1];
+            let rxy1_sq = rxy1 * rxy1;
+            let rxy2_sq = rxy2 * rxy2;
 
-                if best_den * rxy1_sq > den1 * best_num {
-                    best_id = i;
-                    best_num = rxy1_sq;
-                    best_den = den1;
-                }
-                if best_den * rxy2_sq > den2 * best_num {
-                    best_id = i + 1;
-                    best_num = rxy2_sq;
-                    best_den = den2;
-                }
-                i += 2;
+            if best_den * rxy1_sq > den1 * best_num {
+                best_id = i;
+                best_num = rxy1_sq;
+                best_den = den1;
             }
-            if i < n {
-                let rxy = xy + *abs_x_ptr.add(i);
-                let rxy_sq = rxy * rxy;
-                let den = yy + *y2f_ptr.add(i);
-                if best_den * rxy_sq > den * best_num {
-                    best_id = i;
-                }
+            if best_den * rxy2_sq > den2 * best_num {
+                best_id = i + 1;
+                best_num = rxy2_sq;
+                best_den = den2;
             }
-
-            xy += *abs_x_ptr.add(best_id);
-            yy += *y2f_ptr.add(best_id);
-            *y2f_ptr.add(best_id) += 2.0;
-            *y_ptr.add(best_id) += 1;
+            i += 2;
         }
+        if i < n {
+            let rxy = xy + abs_x[i];
+            let rxy_sq = rxy * rxy;
+            let den = yy + y2f[i];
+            if best_den * rxy_sq > den * best_num {
+                best_id = i;
+            }
+        }
+
+        xy += abs_x[best_id];
+        yy += y2f[best_id];
+        y2f[best_id] += 2.0;
+        y[best_id] += 1;
     }
 
-    unsafe {
-        let y_ptr = y.as_mut_ptr();
-        let sign_ptr = sign_x.as_ptr();
-        for i in 0..n {
-            let s = *sign_ptr.add(i);
-            *y_ptr.add(i) = (*y_ptr.add(i) ^ -s) + s;
-        }
+    for i in 0..n {
+        let s = sign_x[i];
+        y[i] = (y[i] ^ -s) + s;
     }
 }
 #[inline]
 fn pvq_search_scalar(x: &[f32], y: &mut [i32], k: i32, n: usize) {
     debug_assert!(n <= 31);
+    let x = &x[..n];
+    let y = &mut y[..n];
     let mut k = k;
     let mut yy = 0.0f32;
     let mut xy = 0.0f32;
@@ -1317,11 +1302,13 @@ fn pvq_search_scalar(x: &[f32], y: &mut [i32], k: i32, n: usize) {
     let mut sign_x = [0i32; 32];
 
     #[cfg(target_arch = "aarch64")]
+    // SAFETY: NEON is part of the aarch64 baseline.
     let sum = unsafe { pvq_search_scalar_init_neon(x, n, &mut abs_x, &mut sign_x) };
     #[cfg(all(not(target_arch = "aarch64"), target_arch = "x86_64"))]
-    let sum = unsafe {
+    let sum = {
         if crate::compat::x86_has_avx2() {
-            pvq_search_scalar_init_avx2(x, n, &mut abs_x, &mut sign_x)
+            // SAFETY: the CPU supports AVX2, checked just above.
+            unsafe { pvq_search_scalar_init_avx2(x, n, &mut abs_x, &mut sign_x) }
         } else {
             let mut s = 0.0f32;
             for i in 0..n {
@@ -1350,81 +1337,71 @@ fn pvq_search_scalar(x: &[f32], y: &mut [i32], k: i32, n: usize) {
     if k > (n >> 1) as i32 && sum > 1e-15 {
         let rcp = (k as f32 + 0.8) / sum;
 
-        let abs_x_ptr = abs_x.as_ptr();
-        let y2f_ptr = y2f.as_mut_ptr();
-        let y_ptr = y.as_mut_ptr();
-        unsafe {
-            for i in 0..n {
-                let yi = (*abs_x_ptr.add(i) * rcp) as i32;
-                *y_ptr.add(i) = yi;
-                let yf = yi as f32;
-                yy += yf * yf;
-                xy += yf * *abs_x_ptr.add(i);
-                *y2f_ptr.add(i) = 2.0 * yf;
-                k -= yi;
-            }
-
-            if k > n as i32 + 3 {
-                let tmp = k as f32;
-                yy += tmp * tmp;
-                yy += tmp * *y_ptr as f32;
-                *y_ptr += k;
-                *y2f_ptr = 2.0 * *y_ptr as f32;
-                k = 0;
-            }
-        }
-    }
-
-    let abs_x_ptr = abs_x.as_ptr();
-    let y2f_ptr = y2f.as_mut_ptr();
-    let y_ptr = y.as_mut_ptr();
-    unsafe {
-        while k > 0 {
-            yy += 1.0;
-
-            let rxy0 = xy + *abs_x_ptr;
-            let mut best_id = 0usize;
-            let mut best_num = rxy0 * rxy0;
-            let mut best_den = yy + *y2f_ptr;
-
-            let mut i = 1;
-            while i < n {
-                let rxy = xy + *abs_x_ptr.add(i);
-                let ryy = yy + *y2f_ptr.add(i);
-                let rxy_sq = rxy * rxy;
-
-                if best_den * rxy_sq > ryy * best_num {
-                    best_num = rxy_sq;
-                    best_den = ryy;
-                    best_id = i;
-                }
-                i += 1;
-            }
-
-            xy += *abs_x_ptr.add(best_id);
-            yy += *y2f_ptr.add(best_id);
-            *y2f_ptr.add(best_id) += 2.0;
-            *y_ptr.add(best_id) += 1;
-            k -= 1;
-        }
-    }
-
-    unsafe {
-        let y_ptr = y.as_mut_ptr();
-        let sign_ptr = sign_x.as_ptr();
         for i in 0..n {
-            let s = *sign_ptr.add(i);
-            *y_ptr.add(i) = (*y_ptr.add(i) ^ -s) + s;
+            let yi = (abs_x[i] * rcp) as i32;
+            y[i] = yi;
+            let yf = yi as f32;
+            yy += yf * yf;
+            xy += yf * abs_x[i];
+            y2f[i] = 2.0 * yf;
+            k -= yi;
         }
+
+        if k > n as i32 + 3 {
+            let tmp = k as f32;
+            yy += tmp * tmp;
+            yy += tmp * y[0] as f32;
+            y[0] += k;
+            y2f[0] = 2.0 * y[0] as f32;
+            k = 0;
+        }
+    }
+
+    while k > 0 {
+        yy += 1.0;
+
+        let rxy0 = xy + abs_x[0];
+        let mut best_id = 0usize;
+        let mut best_num = rxy0 * rxy0;
+        let mut best_den = yy + y2f[0];
+
+        let mut i = 1;
+        while i < n {
+            let rxy = xy + abs_x[i];
+            let ryy = yy + y2f[i];
+            let rxy_sq = rxy * rxy;
+
+            if best_den * rxy_sq > ryy * best_num {
+                best_num = rxy_sq;
+                best_den = ryy;
+                best_id = i;
+            }
+            i += 1;
+        }
+
+        xy += abs_x[best_id];
+        yy += y2f[best_id];
+        y2f[best_id] += 2.0;
+        y[best_id] += 1;
+        k -= 1;
+    }
+
+    for i in 0..n {
+        let s = sign_x[i];
+        y[i] = (y[i] ^ -s) + s;
     }
 }
 
 #[cfg(target_arch = "aarch64")]
 #[inline]
+#[target_feature(enable = "neon")]
 fn pvq_search_neon(x: &[f32], y: &mut [i32], k: i32, n: usize) {
+    use crate::simd::neon::{ld4, st4, st4_s32};
     use core::arch::aarch64::*;
 
     debug_assert!(n <= 16);
+    let x = &x[..n];
+    let y = &mut y[..n];
     let mut k = k;
     let mut yy = 0.0f32;
     let mut xy = 0.0f32;
@@ -1440,132 +1417,111 @@ fn pvq_search_neon(x: &[f32], y: &mut [i32], k: i32, n: usize) {
         let mut y2f_arr = [0.0f32; 16];
         let mut sign_x_arr = [0i32; 16];
 
-        unsafe {
-            let vzero = vdupq_n_f32(0.0);
-            let n4 = n & !3;
-            for i in (0..n4).step_by(4) {
-                let vx = vld1q_f32(x.as_ptr().add(i));
-                let vabs = vabsq_f32(vx);
-                vst1q_f32(abs_x_arr.as_mut_ptr().add(i), vabs);
-                let vneg = vcltq_f32(vx, vzero);
-                let vsign = vandq_u32(vneg, vdupq_n_u32(1));
-                vst1q_s32(sign_x_arr.as_mut_ptr().add(i), vreinterpretq_s32_u32(vsign));
-            }
-            for i in n4..n {
-                let xi = x[i];
-                abs_x_arr[i] = xi.abs();
-                sign_x_arr[i] = (xi < 0.0) as i32;
-            }
+        let vzero = vdupq_n_f32(0.0);
+        let n4 = n & !3;
+        for i in (0..n4).step_by(4) {
+            let vx = ld4(x, i);
+            let vabs = vabsq_f32(vx);
+            st4(&mut abs_x_arr, i, vabs);
+            let vneg = vcltq_f32(vx, vzero);
+            let vsign = vandq_u32(vneg, vdupq_n_u32(1));
+            st4_s32(&mut sign_x_arr, i, vreinterpretq_s32_u32(vsign));
+        }
+        for i in n4..n {
+            let xi = x[i];
+            abs_x_arr[i] = xi.abs();
+            sign_x_arr[i] = (xi < 0.0) as i32;
         }
 
         let mut yy_local = 0.0f32;
         let mut xy_local = 0.0f32;
 
-        let abs_x_ptr = abs_x_arr.as_ptr();
-        let y2f_ptr = y2f_arr.as_mut_ptr();
-        let y_ptr = y.as_mut_ptr();
-        unsafe {
-            for _ in 0..k {
-                yy_local += 1.0;
-                let mut best_num = xy_local + *abs_x_ptr;
-                let mut best_den = yy_local + *y2f_ptr;
-                let mut best_id = 0;
+        for _ in 0..k {
+            yy_local += 1.0;
+            let mut best_num = xy_local + abs_x_arr[0];
+            let mut best_den = yy_local + y2f_arr[0];
+            let mut best_id = 0;
 
-                let mut j = 1;
-                while j < n {
-                    let rxy = xy_local + *abs_x_ptr.add(j);
-                    let ryy = yy_local + *y2f_ptr.add(j);
-                    if best_den * rxy > best_num * ryy {
-                        best_den = ryy;
-                        best_num = rxy;
-                        best_id = j;
-                    }
-                    j += 1;
+            let mut j = 1;
+            while j < n {
+                let rxy = xy_local + abs_x_arr[j];
+                let ryy = yy_local + y2f_arr[j];
+                if best_den * rxy > best_num * ryy {
+                    best_den = ryy;
+                    best_num = rxy;
+                    best_id = j;
                 }
-
-                xy_local += *abs_x_ptr.add(best_id);
-                yy_local += *y2f_ptr.add(best_id);
-                *y2f_ptr.add(best_id) += 2.0;
-                *y_ptr.add(best_id) += 1;
+                j += 1;
             }
+
+            xy_local += abs_x_arr[best_id];
+            yy_local += y2f_arr[best_id];
+            y2f_arr[best_id] += 2.0;
+            y[best_id] += 1;
         }
 
-        unsafe {
-            let sign_ptr = sign_x_arr.as_ptr();
-            for i in 0..n {
-                let s = *sign_ptr.add(i);
-                *y_ptr.add(i) = (*y_ptr.add(i) ^ -s) + s;
-            }
+        for i in 0..n {
+            let s = sign_x_arr[i];
+            y[i] = (y[i] ^ -s) + s;
         }
         return;
     }
 
-    let mut abs_x_mu = [MaybeUninit::<f32>::uninit(); 20];
-    let mut y2f_mu = [MaybeUninit::<f32>::uninit(); 20];
-    let mut sign_x_mu = [MaybeUninit::<i32>::uninit(); 16];
+    let mut abs_x = [0.0f32; 20];
+    let mut y2f = [0.0f32; 20];
+    let mut sign_x = [0i32; 16];
     let mut sum;
 
     let n4 = n & !3;
-    unsafe {
-        let mut vsum = vdupq_n_f32(0.0);
-        let vzero = vdupq_n_f32(0.0);
-        for i in (0..n4).step_by(4) {
-            let vx = vld1q_f32(x.as_ptr().add(i));
-            let vabs = vabsq_f32(vx);
-            vst1q_f32(abs_x_mu.as_mut_ptr().add(i) as *mut f32, vabs);
-            vsum = vaddq_f32(vsum, vabs);
-            let vneg = vcltq_f32(vx, vzero);
-            let vsign = vandq_u32(vneg, vdupq_n_u32(1));
-            vst1q_s32(
-                sign_x_mu.as_mut_ptr().add(i) as *mut i32,
-                vreinterpretq_s32_u32(vsign),
-            );
-        }
-        sum = vaddvq_f32(vsum);
+    let mut vsum = vdupq_n_f32(0.0);
+    let vzero = vdupq_n_f32(0.0);
+    for i in (0..n4).step_by(4) {
+        let vx = ld4(x, i);
+        let vabs = vabsq_f32(vx);
+        st4(&mut abs_x, i, vabs);
+        vsum = vaddq_f32(vsum, vabs);
+        let vneg = vcltq_f32(vx, vzero);
+        let vsign = vandq_u32(vneg, vdupq_n_u32(1));
+        st4_s32(&mut sign_x, i, vreinterpretq_s32_u32(vsign));
     }
+    sum = vaddvq_f32(vsum);
 
     for i in n4..n {
         let xi = x[i];
         let abs_xi = xi.abs();
-        abs_x_mu[i].write(abs_xi);
+        abs_x[i] = abs_xi;
         sum += abs_xi;
-        sign_x_mu[i].write((xi < 0.0) as i32);
+        sign_x[i] = (xi < 0.0) as i32;
     }
-
-    let abs_x = unsafe { core::slice::from_raw_parts_mut(abs_x_mu.as_mut_ptr() as *mut f32, 20) };
-    let y2f = unsafe { core::slice::from_raw_parts_mut(y2f_mu.as_mut_ptr() as *mut f32, 20) };
-    let sign_x = unsafe { core::slice::from_raw_parts_mut(sign_x_mu.as_mut_ptr() as *mut i32, 16) };
 
     let ran_presearch = k > (n >> 1) as i32 && sum > 1e-15;
     if ran_presearch {
         let rcp = (k as f32 + 0.8) / sum;
 
-        unsafe {
-            let vrcp = vdupq_n_f32(rcp);
-            let mut vyy = vdupq_n_f32(0.0);
-            let mut vxy = vdupq_n_f32(0.0);
-            let mut vk_sum = vdupq_n_s32(0);
+        let vrcp = vdupq_n_f32(rcp);
+        let mut vyy = vdupq_n_f32(0.0);
+        let mut vxy = vdupq_n_f32(0.0);
+        let mut vk_sum = vdupq_n_s32(0);
 
-            for i in (0..n4).step_by(4) {
-                let vabs = vld1q_f32(abs_x.as_ptr().add(i));
-                let vyi_f = vmulq_f32(vabs, vrcp);
-                let vyi = vcvtq_s32_f32(vyi_f);
-                vst1q_s32(y.as_mut_ptr().add(i), vyi);
+        for i in (0..n4).step_by(4) {
+            let vabs = ld4(&abs_x, i);
+            let vyi_f = vmulq_f32(vabs, vrcp);
+            let vyi = vcvtq_s32_f32(vyi_f);
+            st4_s32(y, i, vyi);
 
-                let vyi_f = vcvtq_f32_s32(vyi);
-                vyy = vfmaq_f32(vyy, vyi_f, vyi_f);
-                vxy = vfmaq_f32(vxy, vyi_f, vabs);
+            let vyi_f = vcvtq_f32_s32(vyi);
+            vyy = vfmaq_f32(vyy, vyi_f, vyi_f);
+            vxy = vfmaq_f32(vxy, vyi_f, vabs);
 
-                let vy2f = vaddq_f32(vyi_f, vyi_f);
-                vst1q_f32(y2f.as_mut_ptr().add(i), vy2f);
+            let vy2f = vaddq_f32(vyi_f, vyi_f);
+            st4(&mut y2f, i, vy2f);
 
-                vk_sum = vaddq_s32(vk_sum, vyi);
-            }
-
-            yy = vaddvq_f32(vyy);
-            xy = vaddvq_f32(vxy);
-            k -= vaddvq_s32(vk_sum);
+            vk_sum = vaddq_s32(vk_sum, vyi);
         }
+
+        yy = vaddvq_f32(vyy);
+        xy = vaddvq_f32(vxy);
+        k -= vaddvq_s32(vk_sum);
 
         for i in n4..n {
             let yi = (abs_x[i] * rcp) as i32;
@@ -1590,72 +1546,64 @@ fn pvq_search_neon(x: &[f32], y: &mut [i32], k: i32, n: usize) {
         }
     }
 
-    unsafe {
-        let abs_x_ptr = abs_x.as_ptr();
-        let y2f_ptr = y2f.as_mut_ptr();
-        let y_ptr = y.as_mut_ptr();
-        let n4 = n & !3;
+    let n4 = n & !3;
 
-        for _ in 0..k {
-            yy += 1.0;
+    for _ in 0..k {
+        yy += 1.0;
 
-            let vxy = vdupq_n_f32(xy);
-            let vyy = vdupq_n_f32(yy);
-            let mut vmax = vdupq_n_f32(0.0);
-            let mut best_id: usize = 0;
+        let vxy = vdupq_n_f32(xy);
+        let vyy = vdupq_n_f32(yy);
+        let mut vmax = vdupq_n_f32(0.0);
+        let mut best_id: usize = 0;
 
-            let mut j = 0;
-            while j < n4 {
-                let vx = vld1q_f32(abs_x_ptr.add(j));
-                let vy = vld1q_f32(y2f_ptr.add(j));
-                let rxy = vaddq_f32(vx, vxy);
-                let ryy = vaddq_f32(vy, vyy);
-                let inv_sqrt = vrsqrteq_f32(ryy);
-                let score = vmulq_f32(rxy, inv_sqrt);
-                vmax = vmaxq_f32(vmax, score);
-                let sc = core::slice::from_raw_parts(&score as *const float32x4_t as *const f32, 4);
-                let mx = vmaxvq_f32(vmax);
-                for lane in 0..4 {
-                    if sc[lane] == mx {
-                        best_id = j + lane;
-                    }
+        let mut j = 0;
+        while j < n4 {
+            let vx = ld4(&abs_x, j);
+            let vy = ld4(&y2f, j);
+            let rxy = vaddq_f32(vx, vxy);
+            let ryy = vaddq_f32(vy, vyy);
+            let inv_sqrt = vrsqrteq_f32(ryy);
+            let score = vmulq_f32(rxy, inv_sqrt);
+            vmax = vmaxq_f32(vmax, score);
+            let mut sc = [0.0f32; 4];
+            st4(&mut sc, 0, score);
+            let mx = vmaxvq_f32(vmax);
+            for lane in 0..4 {
+                if sc[lane] == mx {
+                    best_id = j + lane;
                 }
-                j += 4;
             }
-
-            while j < n {
-                let rxy = xy + *abs_x_ptr.add(j);
-                let ryy = yy + *y2f_ptr.add(j);
-                let score = rxy * (1.0 / ryy.sqrt());
-                let current_max = vmaxvq_f32(vmax);
-                if score > current_max {
-                    best_id = j;
-                    vmax = vsetq_lane_f32(score, vmax, 0);
-                }
-                j += 1;
-            }
-
-            xy += *abs_x_ptr.add(best_id);
-            yy += *y2f_ptr.add(best_id);
-            *y2f_ptr.add(best_id) += 2.0;
-            *y_ptr.add(best_id) += 1;
+            j += 4;
         }
+
+        while j < n {
+            let rxy = xy + abs_x[j];
+            let ryy = yy + y2f[j];
+            let score = rxy * (1.0 / ryy.sqrt());
+            let current_max = vmaxvq_f32(vmax);
+            if score > current_max {
+                best_id = j;
+                vmax = vsetq_lane_f32(score, vmax, 0);
+            }
+            j += 1;
+        }
+
+        xy += abs_x[best_id];
+        yy += y2f[best_id];
+        y2f[best_id] += 2.0;
+        y[best_id] += 1;
     }
 
-    unsafe {
-        let y_ptr = y.as_mut_ptr();
-        let sign_ptr = sign_x.as_ptr();
-        for i in 0..n {
-            let s = *sign_ptr.add(i);
-            *y_ptr.add(i) = (*y_ptr.add(i) ^ -s) + s;
-        }
+    for i in 0..n {
+        let s = sign_x[i];
+        y[i] = (y[i] ^ -s) + s;
     }
 }
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "avx2,fma")]
-#[allow(unsafe_op_in_unsafe_fn)]
-unsafe fn pvq_search_avx2(x: &[f32], y: &mut [i32], k: i32, n: usize) {
+fn pvq_search_avx2(x: &[f32], y: &mut [i32], k: i32, n: usize) {
+    use crate::simd::x86::{load8, store8, store8_i32};
     #[cfg(target_arch = "x86")]
     use core::arch::x86::*;
     #[cfg(target_arch = "x86_64")]
@@ -1663,6 +1611,8 @@ unsafe fn pvq_search_avx2(x: &[f32], y: &mut [i32], k: i32, n: usize) {
 
     debug_assert!(n <= 31);
     debug_assert!(k > 4);
+    let x = &x[..n];
+    let y = &mut y[..n];
 
     let mut k = k;
     let mut yy = 0.0f32;
@@ -1680,14 +1630,14 @@ unsafe fn pvq_search_avx2(x: &[f32], y: &mut [i32], k: i32, n: usize) {
     let mut acc = _mm256_setzero_ps();
     let mut i = 0;
     while i + 8 <= n {
-        let v = _mm256_loadu_ps(x.as_ptr().add(i));
+        let v = load8(x, i);
         let a = _mm256_andnot_ps(sign_mask, v);
-        _mm256_storeu_ps(abs_x.as_mut_ptr().add(i), a);
+        store8(&mut abs_x, i, a);
         acc = _mm256_add_ps(acc, a);
 
         let neg_mask = _mm256_cmp_ps(v, vzero_ps, _CMP_LT_OS);
         let sign_i = _mm256_and_si256(_mm256_castps_si256(neg_mask), vone_i);
-        _mm256_storeu_si256(sign_x.as_mut_ptr().add(i) as *mut __m256i, sign_i);
+        store8_i32(&mut sign_x, i, sign_i);
         i += 8;
     }
 
@@ -1713,11 +1663,11 @@ unsafe fn pvq_search_avx2(x: &[f32], y: &mut [i32], k: i32, n: usize) {
         let mut vk_acc = _mm256_setzero_ps();
         let mut i = 0;
         while i + 8 <= n {
-            let vabs = _mm256_loadu_ps(abs_x.as_ptr().add(i));
+            let vabs = load8(&abs_x, i);
             let vyi_f32 = _mm256_mul_ps(vabs, vrcp);
 
             let vyi_i = _mm256_cvttps_epi32(vyi_f32);
-            _mm256_storeu_si256(y.as_mut_ptr().add(i) as *mut __m256i, vyi_i);
+            store8_i32(y, i, vyi_i);
             let vyi_f = _mm256_cvtepi32_ps(vyi_i);
 
             vyy_acc = _mm256_fmadd_ps(vyi_f, vyi_f, vyy_acc);
@@ -1725,7 +1675,7 @@ unsafe fn pvq_search_avx2(x: &[f32], y: &mut [i32], k: i32, n: usize) {
             vk_acc = _mm256_add_ps(vk_acc, vyi_f);
 
             let vy2f = _mm256_add_ps(vyi_f, vyi_f);
-            _mm256_storeu_ps(y2f.as_mut_ptr().add(i), vy2f);
+            store8(&mut y2f, i, vy2f);
             i += 8;
         }
 
@@ -1760,9 +1710,6 @@ unsafe fn pvq_search_avx2(x: &[f32], y: &mut [i32], k: i32, n: usize) {
         }
     }
 
-    let abs_x_ptr = abs_x.as_ptr();
-    let y2f_ptr = y2f.as_mut_ptr();
-    let y_ptr = y.as_mut_ptr();
     let n8 = n & !7;
     let n_ceil8 = (n + 7) & !7;
     // Lanes past `n` must never win the tie-break on the maximum score:
@@ -1778,19 +1725,19 @@ unsafe fn pvq_search_avx2(x: &[f32], y: &mut [i32], k: i32, n: usize) {
         let mut vmax = _mm256_setzero_ps();
         let mut j = 0;
         while j < n8 {
-            let vabs = _mm256_loadu_ps(abs_x_ptr.add(j));
-            let vy2f = _mm256_loadu_ps(y2f_ptr.add(j));
+            let vabs = load8(&abs_x, j);
+            let vy2f = load8(&y2f, j);
             let rxy = _mm256_add_ps(vabs, vxy);
             let ryy = _mm256_add_ps(vy2f, vyy);
             let score = _mm256_mul_ps(rxy, _mm256_rsqrt_ps(ryy));
-            _mm256_storeu_ps(scores.as_mut_ptr().add(j), score);
+            store8(&mut scores, j, score);
             vmax = _mm256_max_ps(vmax, score);
             j += 8;
         }
 
         while j < n {
-            let rxy = xy + *abs_x_ptr.add(j);
-            let ryy = yy + *y2f_ptr.add(j);
+            let rxy = xy + abs_x[j];
+            let ryy = yy + y2f[j];
             scores[j] = rxy * (1.0 / ryy.sqrt());
             j += 1;
         }
@@ -1815,7 +1762,7 @@ unsafe fn pvq_search_avx2(x: &[f32], y: &mut [i32], k: i32, n: usize) {
         let mut best_id: usize = 0;
         let mut j = 0;
         while j < n_ceil8 {
-            let vs = _mm256_loadu_ps(scores.as_ptr().add(j));
+            let vs = load8(&scores, j);
             let mask = _mm256_movemask_ps(_mm256_cmp_ps(vs, vgmax, _CMP_EQ_OQ)) as u32;
             if mask != 0 {
                 // C SSE2 keeps the HIGHEST index on ties (pos = max of lanes).
@@ -1824,10 +1771,10 @@ unsafe fn pvq_search_avx2(x: &[f32], y: &mut [i32], k: i32, n: usize) {
             j += 8;
         }
 
-        xy += *abs_x_ptr.add(best_id);
-        yy += *y2f_ptr.add(best_id);
-        *y2f_ptr.add(best_id) += 2.0;
-        *y_ptr.add(best_id) += 1;
+        xy += abs_x[best_id];
+        yy += y2f[best_id];
+        y2f[best_id] += 2.0;
+        y[best_id] += 1;
         k -= 1;
     }
 
@@ -1840,9 +1787,10 @@ unsafe fn pvq_search_avx2(x: &[f32], y: &mut [i32], k: i32, n: usize) {
 #[inline]
 fn exp_rotation1(x: &mut [f32], len: usize, stride: usize, c: f32, s: f32) {
     #[cfg(target_arch = "aarch64")]
+    // SAFETY: NEON is part of the aarch64 baseline.
     unsafe {
-        exp_rotation1_neon(x, len, stride, c, s);
-    }
+        exp_rotation1_neon(x, len, stride, c, s)
+    };
     #[cfg(not(target_arch = "aarch64"))]
     {
         exp_rotation1_scalar(x, len, stride, c, s);
@@ -1869,15 +1817,18 @@ fn exp_rotation1_scalar(x: &mut [f32], len: usize, stride: usize, c: f32, s: f32
 }
 
 #[cfg(target_arch = "aarch64")]
-#[inline(always)]
-#[allow(unsafe_op_in_unsafe_fn)]
-unsafe fn exp_rotation1_neon(x: &mut [f32], len: usize, stride: usize, c: f32, s: f32) {
+#[inline]
+#[target_feature(enable = "neon")]
+fn exp_rotation1_neon(x: &mut [f32], len: usize, stride: usize, c: f32, s: f32) {
     if stride < 4 {
         exp_rotation1_scalar(x, len, stride, c, s);
         return;
     }
 
+    use crate::simd::neon::{ld4, st4};
     use core::arch::aarch64::*;
+
+    let x = &mut x[..len];
 
     let vc = vdupq_n_f32(c);
     let vs = vdupq_n_f32(s);
@@ -1885,16 +1836,16 @@ unsafe fn exp_rotation1_neon(x: &mut [f32], len: usize, stride: usize, c: f32, s
     // Forward pass: SIMD when we can load 4 contiguous elements
     let mut i = 0;
     while i + 4 <= len - stride {
-        let vx1 = vld1q_f32(x.as_ptr().add(i));
-        let vx2 = vld1q_f32(x.as_ptr().add(i + stride));
+        let vx1 = ld4(x, i);
+        let vx2 = ld4(x, i + stride);
 
         // y1 = c*x1 - s*x2
         let vy1 = vfmsq_f32(vmulq_f32(vx1, vc), vs, vx2);
         // y2 = c*x2 + s*x1
         let vy2 = vfmaq_f32(vmulq_f32(vx2, vc), vs, vx1);
 
-        vst1q_f32(x.as_mut_ptr().add(i), vy1);
-        vst1q_f32(x.as_mut_ptr().add(i + stride), vy2);
+        st4(x, i, vy1);
+        st4(x, i + stride, vy2);
 
         i += 4;
     }
@@ -1956,9 +1907,10 @@ pub fn exp_rotation(x: &mut [f32], length: usize, dir: i32, stride: usize, k: i3
 }
 
 #[cfg(target_arch = "aarch64")]
-#[inline(always)]
-#[allow(unsafe_op_in_unsafe_fn)]
-unsafe fn extract_collapse_mask_neon(iy: &[i32], n: usize, b: usize) -> u32 {
+#[inline]
+#[target_feature(enable = "neon")]
+fn extract_collapse_mask_neon(iy: &[i32], n: usize, b: usize) -> u32 {
+    use crate::simd::neon::ld4_s32;
     use core::arch::aarch64::*;
 
     if b <= 1 {
@@ -1976,7 +1928,7 @@ unsafe fn extract_collapse_mask_neon(iy: &[i32], n: usize, b: usize) -> u32 {
         let mut j = 0;
 
         while j < n4 {
-            let v = vld1q_s32(slice.as_ptr().add(j));
+            let v = ld4_s32(slice, j);
 
             let or_val = vorrq_s32(v, vextq_s32(v, v, 2));
             let or_val = vorrq_s32(or_val, vextq_s32(or_val, or_val, 1));
@@ -2010,8 +1962,9 @@ pub fn extract_collapse_mask(iy: &[i32], n: usize, b: usize) -> u32 {
     }
 
     #[cfg(target_arch = "aarch64")]
-    unsafe {
-        extract_collapse_mask_neon(iy, n, b)
+    {
+        // SAFETY: NEON is part of the aarch64 baseline.
+        unsafe { extract_collapse_mask_neon(iy, n, b) }
     }
     #[cfg(not(target_arch = "aarch64"))]
     {
@@ -2033,26 +1986,28 @@ pub fn extract_collapse_mask(iy: &[i32], n: usize, b: usize) -> u32 {
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "avx2,fma")]
-#[allow(unsafe_op_in_unsafe_fn)]
-unsafe fn renormalise_vector_avx2(x: &mut [f32], n: usize, gain: f32) {
+fn renormalise_vector_avx2(x: &mut [f32], n: usize, gain: f32) {
+    use crate::simd::x86::{load8, store8};
     #[cfg(target_arch = "x86")]
     use core::arch::x86::*;
     #[cfg(target_arch = "x86_64")]
     use core::arch::x86_64::*;
+
+    let x = &mut x[..n];
 
     let mut acc0 = _mm256_setzero_ps();
     let mut acc1 = _mm256_setzero_ps();
     let mut i = 0;
 
     while i + 16 <= n {
-        let v0 = _mm256_loadu_ps(x.as_ptr().add(i));
-        let v1 = _mm256_loadu_ps(x.as_ptr().add(i + 8));
+        let v0 = load8(x, i);
+        let v1 = load8(x, i + 8);
         acc0 = _mm256_fmadd_ps(v0, v0, acc0);
         acc1 = _mm256_fmadd_ps(v1, v1, acc1);
         i += 16;
     }
     while i + 8 <= n {
-        let v0 = _mm256_loadu_ps(x.as_ptr().add(i));
+        let v0 = load8(x, i);
         acc0 = _mm256_fmadd_ps(v0, v0, acc0);
         i += 8;
     }
@@ -2072,15 +2027,15 @@ unsafe fn renormalise_vector_avx2(x: &mut [f32], n: usize, gain: f32) {
     let vnorm = _mm256_set1_ps(g);
     i = 0;
     while i + 16 <= n {
-        let v0 = _mm256_loadu_ps(x.as_ptr().add(i));
-        let v1 = _mm256_loadu_ps(x.as_ptr().add(i + 8));
-        _mm256_storeu_ps(x.as_mut_ptr().add(i), _mm256_mul_ps(v0, vnorm));
-        _mm256_storeu_ps(x.as_mut_ptr().add(i + 8), _mm256_mul_ps(v1, vnorm));
+        let v0 = load8(x, i);
+        let v1 = load8(x, i + 8);
+        store8(x, i, _mm256_mul_ps(v0, vnorm));
+        store8(x, i + 8, _mm256_mul_ps(v1, vnorm));
         i += 16;
     }
     while i + 8 <= n {
-        let v0 = _mm256_loadu_ps(x.as_ptr().add(i));
-        _mm256_storeu_ps(x.as_mut_ptr().add(i), _mm256_mul_ps(v0, vnorm));
+        let v0 = load8(x, i);
+        store8(x, i, _mm256_mul_ps(v0, vnorm));
         i += 8;
     }
     for j in i..n {
@@ -2090,20 +2045,23 @@ unsafe fn renormalise_vector_avx2(x: &mut [f32], n: usize, gain: f32) {
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "avx2,fma")]
-#[allow(unsafe_op_in_unsafe_fn)]
-unsafe fn alg_quant_resynth_avx2(y: &[i32], x: &mut [f32], n: usize, gain: f32) {
+fn alg_quant_resynth_avx2(y: &[i32], x: &mut [f32], n: usize, gain: f32) {
+    use crate::simd::x86::{load8, load8_i32, store8};
     #[cfg(target_arch = "x86")]
     use core::arch::x86::*;
     #[cfg(target_arch = "x86_64")]
     use core::arch::x86_64::*;
 
+    let y = &y[..n];
+    let x = &mut x[..n];
+
     let mut acc0 = _mm256_setzero_ps();
     let mut i = 0;
 
     while i + 8 <= n {
-        let yi = _mm256_loadu_si256(y.as_ptr().add(i) as *const __m256i);
+        let yi = load8_i32(y, i);
         let yf = _mm256_cvtepi32_ps(yi);
-        _mm256_storeu_ps(x.as_mut_ptr().add(i), yf);
+        store8(x, i, yf);
         acc0 = _mm256_fmadd_ps(yf, yf, acc0);
         i += 8;
     }
@@ -2126,8 +2084,8 @@ unsafe fn alg_quant_resynth_avx2(y: &[i32], x: &mut [f32], n: usize, gain: f32) 
 
     i = 0;
     while i + 8 <= n {
-        let v = _mm256_loadu_ps(x.as_ptr().add(i));
-        _mm256_storeu_ps(x.as_mut_ptr().add(i), _mm256_mul_ps(v, vg));
+        let v = load8(x, i);
+        store8(x, i, _mm256_mul_ps(v, vg));
         i += 8;
     }
     for j in i..n {
@@ -2137,25 +2095,27 @@ unsafe fn alg_quant_resynth_avx2(y: &[i32], x: &mut [f32], n: usize, gain: f32) 
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "avx2")]
-#[allow(unsafe_op_in_unsafe_fn)]
-unsafe fn pvq_search_scalar_init_avx2(
+fn pvq_search_scalar_init_avx2(
     x: &[f32],
     n: usize,
     abs_x: &mut [f32; 32],
     sign_x: &mut [i32; 32],
 ) -> f32 {
+    use crate::simd::x86::{load8, store8};
     #[cfg(target_arch = "x86")]
     use core::arch::x86::*;
     #[cfg(target_arch = "x86_64")]
     use core::arch::x86_64::*;
+
+    let x = &x[..n];
     let sign_mask = _mm256_set1_ps(-0.0f32);
     let mut acc = _mm256_setzero_ps();
     let mut i = 0;
 
     while i + 8 <= n {
-        let v = _mm256_loadu_ps(x.as_ptr().add(i));
+        let v = load8(x, i);
         let a = _mm256_andnot_ps(sign_mask, v);
-        _mm256_storeu_ps(abs_x.as_mut_ptr().add(i), a);
+        store8(abs_x, i, a);
         acc = _mm256_add_ps(acc, a);
 
         for j in 0..8 {
@@ -2181,19 +2141,22 @@ unsafe fn pvq_search_scalar_init_avx2(
 }
 
 #[cfg(target_arch = "aarch64")]
-#[inline(always)]
-#[allow(unsafe_op_in_unsafe_fn)]
-unsafe fn renormalise_vector_neon(x: &mut [f32], n: usize, gain: f32) {
+#[inline]
+#[target_feature(enable = "neon")]
+fn renormalise_vector_neon(x: &mut [f32], n: usize, gain: f32) {
+    use crate::simd::neon::{ld4, st4};
     use core::arch::aarch64::*;
+
+    let x = &mut x[..n];
 
     let mut sum_vec = vdupq_n_f32(0.0);
     let mut i = 0;
 
     while i + 16 <= n {
-        let x0 = vld1q_f32(x.as_ptr().add(i));
-        let x1 = vld1q_f32(x.as_ptr().add(i + 4));
-        let x2 = vld1q_f32(x.as_ptr().add(i + 8));
-        let x3 = vld1q_f32(x.as_ptr().add(i + 12));
+        let x0 = ld4(x, i);
+        let x1 = ld4(x, i + 4);
+        let x2 = ld4(x, i + 8);
+        let x3 = ld4(x, i + 12);
         sum_vec = vfmaq_f32(sum_vec, x0, x0);
         sum_vec = vfmaq_f32(sum_vec, x1, x1);
         sum_vec = vfmaq_f32(sum_vec, x2, x2);
@@ -2202,15 +2165,15 @@ unsafe fn renormalise_vector_neon(x: &mut [f32], n: usize, gain: f32) {
     }
 
     while i + 8 <= n {
-        let x0 = vld1q_f32(x.as_ptr().add(i));
-        let x1 = vld1q_f32(x.as_ptr().add(i + 4));
+        let x0 = ld4(x, i);
+        let x1 = ld4(x, i + 4);
         sum_vec = vfmaq_f32(sum_vec, x0, x0);
         sum_vec = vfmaq_f32(sum_vec, x1, x1);
         i += 8;
     }
 
     while i + 4 <= n {
-        let x0 = vld1q_f32(x.as_ptr().add(i));
+        let x0 = ld4(x, i);
         sum_vec = vfmaq_f32(sum_vec, x0, x0);
         i += 4;
     }
@@ -2225,28 +2188,28 @@ unsafe fn renormalise_vector_neon(x: &mut [f32], n: usize, gain: f32) {
 
     i = 0;
     while i + 16 <= n {
-        let x0 = vld1q_f32(x.as_ptr().add(i));
-        let x1 = vld1q_f32(x.as_ptr().add(i + 4));
-        let x2 = vld1q_f32(x.as_ptr().add(i + 8));
-        let x3 = vld1q_f32(x.as_ptr().add(i + 12));
-        vst1q_f32(x.as_mut_ptr().add(i), vmulq_f32(x0, vg));
-        vst1q_f32(x.as_mut_ptr().add(i + 4), vmulq_f32(x1, vg));
-        vst1q_f32(x.as_mut_ptr().add(i + 8), vmulq_f32(x2, vg));
-        vst1q_f32(x.as_mut_ptr().add(i + 12), vmulq_f32(x3, vg));
+        let x0 = ld4(x, i);
+        let x1 = ld4(x, i + 4);
+        let x2 = ld4(x, i + 8);
+        let x3 = ld4(x, i + 12);
+        st4(x, i, vmulq_f32(x0, vg));
+        st4(x, i + 4, vmulq_f32(x1, vg));
+        st4(x, i + 8, vmulq_f32(x2, vg));
+        st4(x, i + 12, vmulq_f32(x3, vg));
         i += 16;
     }
 
     while i + 8 <= n {
-        let x0 = vld1q_f32(x.as_ptr().add(i));
-        let x1 = vld1q_f32(x.as_ptr().add(i + 4));
-        vst1q_f32(x.as_mut_ptr().add(i), vmulq_f32(x0, vg));
-        vst1q_f32(x.as_mut_ptr().add(i + 4), vmulq_f32(x1, vg));
+        let x0 = ld4(x, i);
+        let x1 = ld4(x, i + 4);
+        st4(x, i, vmulq_f32(x0, vg));
+        st4(x, i + 4, vmulq_f32(x1, vg));
         i += 8;
     }
 
     while i + 4 <= n {
-        let x0 = vld1q_f32(x.as_ptr().add(i));
-        vst1q_f32(x.as_mut_ptr().add(i), vmulq_f32(x0, vg));
+        let x0 = ld4(x, i);
+        st4(x, i, vmulq_f32(x0, vg));
         i += 4;
     }
 
@@ -2257,15 +2220,15 @@ unsafe fn renormalise_vector_neon(x: &mut [f32], n: usize, gain: f32) {
 
 pub fn renormalise_vector(x: &mut [f32], n: usize, gain: f32) {
     #[cfg(target_arch = "aarch64")]
+    // SAFETY: NEON is part of the aarch64 baseline.
     unsafe {
-        renormalise_vector_neon(x, n, gain);
-    }
+        renormalise_vector_neon(x, n, gain)
+    };
     #[cfg(target_arch = "x86_64")]
-    unsafe {
-        if n >= 8 && crate::compat::x86_has_avx2_fma() {
-            renormalise_vector_avx2(x, n, gain);
-            return;
-        }
+    if n >= 8 && crate::compat::x86_has_avx2_fma() {
+        // SAFETY: the CPU supports AVX2 and FMA, checked just above.
+        unsafe { renormalise_vector_avx2(x, n, gain) };
+        return;
     }
     #[cfg(not(target_arch = "aarch64"))]
     {
@@ -2281,24 +2244,28 @@ pub fn renormalise_vector(x: &mut [f32], n: usize, gain: f32) {
 }
 
 #[cfg(target_arch = "aarch64")]
-#[inline(always)]
-#[allow(unsafe_op_in_unsafe_fn)]
-unsafe fn alg_quant_resynth_neon(y: &[i32], x: &mut [f32], n: usize, gain: f32) {
+#[inline]
+#[target_feature(enable = "neon")]
+fn alg_quant_resynth_neon(y: &[i32], x: &mut [f32], n: usize, gain: f32) {
+    use crate::simd::neon::{ld4, ld4_s32, st4};
     use core::arch::aarch64::*;
+
+    let y = &y[..n];
+    let x = &mut x[..n];
 
     let mut sum_vec = vdupq_n_f32(0.0);
     let n8 = n & !7;
     let mut i = 0;
 
     while i < n8 {
-        let yi0 = vld1q_s32(y.as_ptr().add(i));
-        let yi1 = vld1q_s32(y.as_ptr().add(i + 4));
+        let yi0 = ld4_s32(y, i);
+        let yi1 = ld4_s32(y, i + 4);
 
         let yf0 = vcvtq_f32_s32(yi0);
         let yf1 = vcvtq_f32_s32(yi1);
 
-        vst1q_f32(x.as_mut_ptr().add(i), yf0);
-        vst1q_f32(x.as_mut_ptr().add(i + 4), yf1);
+        st4(x, i, yf0);
+        st4(x, i + 4, yf1);
 
         sum_vec = vfmaq_f32(sum_vec, yf0, yf0);
         sum_vec = vfmaq_f32(sum_vec, yf1, yf1);
@@ -2318,12 +2285,12 @@ unsafe fn alg_quant_resynth_neon(y: &[i32], x: &mut [f32], n: usize, gain: f32) 
 
     i = 0;
     while i < n8 {
-        let vx0 = vld1q_f32(x.as_ptr().add(i));
-        let vx1 = vld1q_f32(x.as_ptr().add(i + 4));
+        let vx0 = ld4(x, i);
+        let vx1 = ld4(x, i + 4);
         let vr0 = vmulq_f32(vx0, vg);
         let vr1 = vmulq_f32(vx1, vg);
-        vst1q_f32(x.as_mut_ptr().add(i), vr0);
-        vst1q_f32(x.as_mut_ptr().add(i + 4), vr1);
+        st4(x, i, vr0);
+        st4(x, i + 4, vr1);
         i += 8;
     }
 
@@ -2336,11 +2303,10 @@ unsafe fn alg_quant_resynth_neon(y: &[i32], x: &mut [f32], n: usize, gain: f32) 
 #[inline(always)]
 fn alg_quant_resynth_scalar(y: &[i32], x: &mut [f32], n: usize, gain: f32) {
     #[cfg(target_arch = "x86_64")]
-    unsafe {
-        if crate::compat::x86_has_avx2_fma() {
-            alg_quant_resynth_avx2(y, x, n, gain);
-            return;
-        }
+    if crate::compat::x86_has_avx2_fma() {
+        // SAFETY: the CPU supports AVX2 and FMA, checked just above.
+        unsafe { alg_quant_resynth_avx2(y, x, n, gain) };
+        return;
     }
     let mut ryy = 0.0f32;
     for i in 0..n {
@@ -2391,9 +2357,10 @@ pub fn alg_quant(
 
         if resynth {
             #[cfg(target_arch = "aarch64")]
+            // SAFETY: NEON is part of the aarch64 baseline.
             unsafe {
-                alg_quant_resynth_neon(y, x, n, gain);
-            }
+                alg_quant_resynth_neon(y, x, n, gain)
+            };
             #[cfg(not(target_arch = "aarch64"))]
             alg_quant_resynth_scalar(y, x, n, gain);
             exp_rotation(x, n, -1, stride, k, spread);
@@ -2410,9 +2377,10 @@ pub fn alg_quant(
 
         if resynth {
             #[cfg(target_arch = "aarch64")]
+            // SAFETY: NEON is part of the aarch64 baseline.
             unsafe {
-                alg_quant_resynth_neon(y, x, n, gain);
-            }
+                alg_quant_resynth_neon(y, x, n, gain)
+            };
             #[cfg(not(target_arch = "aarch64"))]
             alg_quant_resynth_scalar(y, x, n, gain);
             exp_rotation(x, n, -1, stride, k, spread);
@@ -2460,9 +2428,10 @@ pub fn alg_quant_qext(
 
             if resynth {
                 #[cfg(target_arch = "aarch64")]
+                // SAFETY: NEON is part of the aarch64 baseline.
                 unsafe {
-                    alg_quant_resynth_neon(y, x, n, gain);
-                }
+                    alg_quant_resynth_neon(y, x, n, gain)
+                };
                 #[cfg(not(target_arch = "aarch64"))]
                 alg_quant_resynth_scalar(y, x, n, gain);
                 exp_rotation(x, n, -1, stride, k, spread);
@@ -2489,9 +2458,10 @@ pub fn alg_quant_qext(
 
             if resynth {
                 #[cfg(target_arch = "aarch64")]
+                // SAFETY: NEON is part of the aarch64 baseline.
                 unsafe {
-                    alg_quant_resynth_neon(&up_y, x, n, gain);
-                }
+                    alg_quant_resynth_neon(&up_y, x, n, gain)
+                };
                 #[cfg(not(target_arch = "aarch64"))]
                 alg_quant_resynth_scalar(&up_y, x, n, gain);
                 exp_rotation(x, n, -1, stride, k, spread);
@@ -2505,9 +2475,10 @@ pub fn alg_quant_qext(
 
         if resynth {
             #[cfg(target_arch = "aarch64")]
+            // SAFETY: NEON is part of the aarch64 baseline.
             unsafe {
-                alg_quant_resynth_neon(y, x, n, gain);
-            }
+                alg_quant_resynth_neon(y, x, n, gain)
+            };
             #[cfg(not(target_arch = "aarch64"))]
             alg_quant_resynth_scalar(y, x, n, gain);
             exp_rotation(x, n, -1, stride, k, spread);
@@ -2556,9 +2527,10 @@ pub fn alg_unquant(
     let mask = extract_collapse_mask(&y[..n], n, stride);
 
     #[cfg(target_arch = "aarch64")]
+    // SAFETY: NEON is part of the aarch64 baseline.
     unsafe {
-        alg_quant_resynth_neon(&y[..n], x, n, gain);
-    }
+        alg_quant_resynth_neon(&y[..n], x, n, gain)
+    };
     #[cfg(not(target_arch = "aarch64"))]
     {
         alg_quant_resynth_scalar(&y[..n], x, n, gain);

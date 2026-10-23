@@ -32,6 +32,42 @@ pub(crate) mod x86 {
         // SAFETY: `d` is 8 writable f32s; storeu has no alignment requirement.
         unsafe { _mm256_storeu_ps(d.as_mut_ptr(), v) }
     }
+
+    /// Loads `s[i..i + 4]`.
+    #[inline]
+    #[target_feature(enable = "sse")]
+    pub(crate) fn load4(s: &[f32], i: usize) -> __m128 {
+        let v = &s[i..i + 4];
+        // SAFETY: `v` is 4 readable f32s; loadu has no alignment requirement.
+        unsafe { _mm_loadu_ps(v.as_ptr()) }
+    }
+
+    /// Loads `s[i..i + 8]` as eight i32 lanes.
+    #[inline]
+    #[target_feature(enable = "avx")]
+    pub(crate) fn load8_i32(s: &[i32], i: usize) -> __m256i {
+        let v = &s[i..i + 8];
+        // SAFETY: `v` is 32 readable bytes; loadu has no alignment requirement.
+        unsafe { _mm256_loadu_si256(v.as_ptr().cast()) }
+    }
+
+    /// Stores eight i32 lanes to `s[i..i + 8]`.
+    #[inline]
+    #[target_feature(enable = "avx")]
+    pub(crate) fn store8_i32(s: &mut [i32], i: usize, v: __m256i) {
+        let d = &mut s[i..i + 8];
+        // SAFETY: `d` is 32 writable bytes; storeu has no alignment requirement.
+        unsafe { _mm256_storeu_si256(d.as_mut_ptr().cast(), v) }
+    }
+
+    /// Stores four i32 lanes to `s[i..i + 4]`.
+    #[inline]
+    #[target_feature(enable = "sse2")]
+    pub(crate) fn store4_i32(s: &mut [i32], i: usize, v: __m128i) {
+        let d = &mut s[i..i + 4];
+        // SAFETY: `d` is 16 writable bytes; storeu has no alignment requirement.
+        unsafe { _mm_storeu_si128(d.as_mut_ptr().cast(), v) }
+    }
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -73,5 +109,23 @@ pub(crate) mod neon {
         let d = &mut s[i..i + 8];
         // SAFETY: `d` is 8 writable f32s, exactly what vst2q writes.
         unsafe { vst2q_f32(d.as_mut_ptr(), v) }
+    }
+
+    /// Loads `s[i..i + 4]` as four i32 lanes.
+    #[inline]
+    #[target_feature(enable = "neon")]
+    pub(crate) fn ld4_s32(s: &[i32], i: usize) -> int32x4_t {
+        let v = &s[i..i + 4];
+        // SAFETY: `v` is 4 readable i32s.
+        unsafe { vld1q_s32(v.as_ptr()) }
+    }
+
+    /// Stores four i32 lanes to `s[i..i + 4]`.
+    #[inline]
+    #[target_feature(enable = "neon")]
+    pub(crate) fn st4_s32(s: &mut [i32], i: usize, v: int32x4_t) {
+        let d = &mut s[i..i + 4];
+        // SAFETY: `d` is 4 writable i32s.
+        unsafe { vst1q_s32(d.as_mut_ptr(), v) }
     }
 }
