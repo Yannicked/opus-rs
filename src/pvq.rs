@@ -231,19 +231,31 @@ pub fn icwrs(n: u32, _k: u32, y: &[i32]) -> u32 {
 }
 
 #[inline(always)]
-pub fn cwrsi(n: u32, k: u32, mut i: u32, y: &mut [i32]) {
+pub fn cwrsi(n: u32, k: u32, i: u32, y: &mut [i32]) {
+    let mut j = 0;
+    cwrsi_emit(n, k, i, |v| {
+        y[j] = v;
+        j += 1;
+    });
+}
+
+/// The body of [`cwrsi`]: decodes the pulse vector for index `i` and hands
+/// each coordinate to `emit`, in order from the first to the last. Writing
+/// through a callback lets [`alg_unquant`] consume the pulses as they are
+/// decoded, without a scratch vector.
+#[inline(always)]
+fn cwrsi_emit(n: u32, k: u32, mut i: u32, mut emit: impl FnMut(i32)) {
     debug_assert!(k > 0, "cwrsi: k must be > 0");
 
     if n == 1 {
         let s = -(i as i32);
-        y[0] = ((k as i32) + s) ^ s;
+        emit(((k as i32) + s) ^ s);
         return;
     }
 
     let mut curr_n = n;
 
     let mut curr_k = k as i32;
-    let mut j = 0usize;
 
     while curr_n > 2 {
         if curr_k >= curr_n as i32 {
@@ -275,14 +287,13 @@ pub fn cwrsi(n: u32, k: u32, mut i: u32, y: &mut [i32]) {
             }
             i -= p;
             let val = k0 - curr_k;
-            y[j] = (val + s) ^ s;
+            emit((val + s) ^ s);
         } else {
             let p_k = celt_pvq_u_lookup(curr_k as u32, curr_n);
             let p_kp1 = celt_pvq_u_lookup((curr_k + 1) as u32, curr_n);
             if p_k <= i && i < p_kp1 {
                 i -= p_k;
-                y[j] = 0;
-                j += 1;
+                emit(0);
                 curr_n -= 1;
                 continue;
             }
@@ -304,9 +315,8 @@ pub fn cwrsi(n: u32, k: u32, mut i: u32, y: &mut [i32]) {
             }
             i -= p;
             let val = k0 - curr_k;
-            y[j] = (val + s) ^ s;
+            emit((val + s) ^ s);
         }
-        j += 1;
         curr_n -= 1;
     }
 
@@ -322,11 +332,10 @@ pub fn cwrsi(n: u32, k: u32, mut i: u32, y: &mut [i32]) {
     if curr_k > 0 {
         i -= 2 * curr_k as u32 - 1;
     }
-    y[j] = ((k0 - curr_k) + s2) ^ s2;
-    j += 1;
+    emit(((k0 - curr_k) + s2) ^ s2);
 
     let s1 = -(i as i32);
-    y[j] = (curr_k + s1) ^ s1;
+    emit((curr_k + s1) ^ s1);
 }
 
 #[inline(always)]
@@ -2520,20 +2529,64 @@ pub fn alg_unquant(
     rc: &mut RangeCoder,
     gain: f32,
 ) -> u32 {
-    let mut y_mu = scratch::uninit::<i32, MAX_PVQ_N>();
-    let y = zeroed_prefix(&mut y_mu, n);
-    decode_pulses(&mut y[..n], n as u32, k as u32, rc);
-
-    let mask = extract_collapse_mask(&y[..n], n, stride);
-
-    #[cfg(target_arch = "aarch64")]
-    // SAFETY: NEON is part of the aarch64 baseline.
-    unsafe {
-        alg_quant_resynth_neon(&y[..n], x, n, gain)
+    // One pass: the pulses are written straight into `x` as they are
+    // decoded, while their energy and the collapse mask are accumulated, so
+    // there is no pulse scratch vector to clear and no second sweep.
+    let x = &mut x[..n];
+    let b = stride;
+    let n0 = if b > 1 { n / b } else { n };
+    let mut ryy_int: u64 = 0;
+    if k == 0 {
+        x.fill(0.0);
+    } else {
+        let ft = celt_pvq_v(n as u32, k as u32);
+        let fl = rc.dec_uint(ft).min(ft.saturating_sub(1));
+        let mut xs = x.iter_mut();
+        cwrsi_emit(n as u32, k as u32, fl, |v| {
+            if let Some(xv) = xs.next() {
+                *xv = v as f32;
+            }
+            ryy_int += (v as i64 * v as i64) as u64;
+        });
+    }
+    // Collapse mask: which of the `b` blocks of `n0` got any pulse.
+    let mask = if b <= 1 {
+        1
+    } else {
+        let mut mask = 0u32;
+        if n0 > 0 {
+            for (i, blk) in x.chunks_exact(n0).take(b).enumerate() {
+                if blk.iter().any(|&v| v != 0.0) {
+                    mask |= 1 << i;
+                }
+            }
+        }
+        mask
     };
-    #[cfg(not(target_arch = "aarch64"))]
-    {
-        alg_quant_resynth_scalar(&y[..n], x, n, gain);
+
+    // Every partial sum of y^2 is an integer no larger than the total, so
+    // below 2^24 any f32 summation order (the SIMD kernels' lanes included)
+    // gives exactly this value. K^2 bounds the total and stays far below.
+    if ryy_int < (1 << 24) {
+        let g = gain / (1e-15f32 + ryy_int as f32).sqrt();
+        for v in x.iter_mut() {
+            *v *= g;
+        }
+    } else {
+        // Out of the exact range: redo the old per-architecture resynthesis
+        // on the integer pulses so the rounding stays the same.
+        let mut y_mu = scratch::uninit::<i32, MAX_PVQ_N>();
+        let y = zeroed_prefix(&mut y_mu, n);
+        for (yv, &xv) in y.iter_mut().zip(x.iter()) {
+            *yv = xv as i32;
+        }
+        #[cfg(target_arch = "aarch64")]
+        // SAFETY: NEON is part of the aarch64 baseline.
+        unsafe {
+            alg_quant_resynth_neon(y, x, n, gain)
+        };
+        #[cfg(not(target_arch = "aarch64"))]
+        alg_quant_resynth_scalar(y, x, n, gain);
     }
 
     exp_rotation(x, n, -1, stride, k, spread);
