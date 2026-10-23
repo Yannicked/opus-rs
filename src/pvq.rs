@@ -2329,6 +2329,38 @@ fn alg_quant_resynth_scalar(y: &[i32], x: &mut [f32], n: usize, gain: f32) {
     }
 }
 
+/// `x = gain * y / |y|`. The energy `sum(y^2)` is an exact integer; below
+/// 2^24 every partial sum is exact in f32 too, so any summation order (the
+/// SIMD kernels' lanes included) yields this same value and the result is
+/// bit-identical to [`resynth_arch`] without a float reduction. Pulse counts
+/// are at most 128, so the total stays far below that bound.
+#[inline]
+fn resynth_exact(y: &[i32], x: &mut [f32], n: usize, gain: f32) {
+    let y = &y[..n];
+    let ryy: u64 = y.iter().map(|&v| (v as i64 * v as i64) as u64).sum();
+    if ryy >= 1 << 24 {
+        resynth_arch(y, x, n, gain);
+        return;
+    }
+    let g = gain / (1e-15f32 + ryy as f32).sqrt();
+    for (xv, &yv) in x[..n].iter_mut().zip(y) {
+        *xv = yv as f32 * g;
+    }
+}
+
+/// The per-architecture resynthesis kernels, for energies outside the range
+/// where [`resynth_exact`] is exact.
+#[inline]
+fn resynth_arch(y: &[i32], x: &mut [f32], n: usize, gain: f32) {
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: NEON is part of the aarch64 baseline.
+    unsafe {
+        alg_quant_resynth_neon(y, x, n, gain)
+    };
+    #[cfg(not(target_arch = "aarch64"))]
+    alg_quant_resynth_scalar(y, x, n, gain);
+}
+
 fn ec_enc_refine(rc: &mut RangeCoder, refine: i32, up: i32, extra_bits: i32) {
     let half_up = up / 2;
     let large = refine.abs() > half_up;
@@ -2365,13 +2397,7 @@ pub fn alg_quant(
         encode_pulses(y, n as u32, k as u32, rc);
 
         if resynth {
-            #[cfg(target_arch = "aarch64")]
-            // SAFETY: NEON is part of the aarch64 baseline.
-            unsafe {
-                alg_quant_resynth_neon(y, x, n, gain)
-            };
-            #[cfg(not(target_arch = "aarch64"))]
-            alg_quant_resynth_scalar(y, x, n, gain);
+            resynth_exact(y, x, n, gain);
             exp_rotation(x, n, -1, stride, k, spread);
         }
         mask
@@ -2385,13 +2411,7 @@ pub fn alg_quant(
         encode_pulses(&y[..n], n as u32, k as u32, rc);
 
         if resynth {
-            #[cfg(target_arch = "aarch64")]
-            // SAFETY: NEON is part of the aarch64 baseline.
-            unsafe {
-                alg_quant_resynth_neon(y, x, n, gain)
-            };
-            #[cfg(not(target_arch = "aarch64"))]
-            alg_quant_resynth_scalar(y, x, n, gain);
+            resynth_exact(y, x, n, gain);
             exp_rotation(x, n, -1, stride, k, spread);
         }
         mask
@@ -2436,13 +2456,7 @@ pub fn alg_quant_qext(
             }
 
             if resynth {
-                #[cfg(target_arch = "aarch64")]
-                // SAFETY: NEON is part of the aarch64 baseline.
-                unsafe {
-                    alg_quant_resynth_neon(y, x, n, gain)
-                };
-                #[cfg(not(target_arch = "aarch64"))]
-                alg_quant_resynth_scalar(y, x, n, gain);
+                resynth_exact(y, x, n, gain);
                 exp_rotation(x, n, -1, stride, k, spread);
             }
             return mask;
@@ -2466,13 +2480,7 @@ pub fn alg_quant_qext(
             }
 
             if resynth {
-                #[cfg(target_arch = "aarch64")]
-                // SAFETY: NEON is part of the aarch64 baseline.
-                unsafe {
-                    alg_quant_resynth_neon(&up_y, x, n, gain)
-                };
-                #[cfg(not(target_arch = "aarch64"))]
-                alg_quant_resynth_scalar(&up_y, x, n, gain);
+                resynth_exact(&up_y, x, n, gain);
                 exp_rotation(x, n, -1, stride, k, spread);
             }
             return mask;
@@ -2483,13 +2491,7 @@ pub fn alg_quant_qext(
         encode_pulses(y, n as u32, k as u32, rc);
 
         if resynth {
-            #[cfg(target_arch = "aarch64")]
-            // SAFETY: NEON is part of the aarch64 baseline.
-            unsafe {
-                alg_quant_resynth_neon(y, x, n, gain)
-            };
-            #[cfg(not(target_arch = "aarch64"))]
-            alg_quant_resynth_scalar(y, x, n, gain);
+            resynth_exact(y, x, n, gain);
             exp_rotation(x, n, -1, stride, k, spread);
         }
         mask
@@ -2573,20 +2575,14 @@ pub fn alg_unquant(
             *v *= g;
         }
     } else {
-        // Out of the exact range: redo the old per-architecture resynthesis
-        // on the integer pulses so the rounding stays the same.
+        // Out of the exact range: redo the per-architecture resynthesis on
+        // the integer pulses so the rounding stays the same.
         let mut y_mu = scratch::uninit::<i32, MAX_PVQ_N>();
         let y = zeroed_prefix(&mut y_mu, n);
         for (yv, &xv) in y.iter_mut().zip(x.iter()) {
             *yv = xv as i32;
         }
-        #[cfg(target_arch = "aarch64")]
-        // SAFETY: NEON is part of the aarch64 baseline.
-        unsafe {
-            alg_quant_resynth_neon(y, x, n, gain)
-        };
-        #[cfg(not(target_arch = "aarch64"))]
-        alg_quant_resynth_scalar(y, x, n, gain);
+        resynth_arch(y, x, n, gain);
     }
 
     exp_rotation(x, n, -1, stride, k, spread);
