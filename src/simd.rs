@@ -59,6 +59,15 @@ pub(crate) mod x86 {
         unsafe { _mm_loadu_ps(v.as_ptr()) }
     }
 
+    /// Stores `v` to `s[i..i + 4]`.
+    #[inline]
+    #[target_feature(enable = "sse")]
+    pub(crate) fn store4(s: &mut [f32], i: usize, v: __m128) {
+        let d = &mut s[i..i + 4];
+        // SAFETY: `d` is 4 writable f32s; storeu has no alignment requirement.
+        unsafe { _mm_storeu_ps(d.as_mut_ptr(), v) }
+    }
+
     /// Loads `s[i..i + 8]` as eight i32 lanes.
     #[inline]
     #[target_feature(enable = "avx")]
