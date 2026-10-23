@@ -68,6 +68,24 @@ pub(crate) mod x86 {
         unsafe { _mm_storeu_ps(d.as_mut_ptr(), v) }
     }
 
+    /// Loads `s[i..i + 16]` as sixteen i16 lanes.
+    #[inline]
+    #[target_feature(enable = "avx")]
+    pub(crate) fn load16_i16(s: &[i16], i: usize) -> __m256i {
+        let v = &s[i..i + 16];
+        // SAFETY: `v` is 32 readable bytes; loadu has no alignment requirement.
+        unsafe { _mm256_loadu_si256(v.as_ptr().cast()) }
+    }
+
+    /// Loads `s[i..i + 8]` as eight i16 lanes.
+    #[inline]
+    #[target_feature(enable = "sse2")]
+    pub(crate) fn load8_i16(s: &[i16], i: usize) -> __m128i {
+        let v = &s[i..i + 8];
+        // SAFETY: `v` is 16 readable bytes; loadu has no alignment requirement.
+        unsafe { _mm_loadu_si128(v.as_ptr().cast()) }
+    }
+
     /// Loads `s[i..i + 8]` as eight i32 lanes.
     #[inline]
     #[target_feature(enable = "avx")]
