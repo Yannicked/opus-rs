@@ -596,7 +596,47 @@ fn dual_inner_prod_avx(x: &[f32], y1: &[f32], y2: &[f32], n: usize) -> (f32, f32
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "avx,fma")]
 fn pitch_xcorr_avx(x: &[f32], y: &[f32], xcorr: &mut [f32], len: usize, max_pitch: usize) {
+    // Eight lags per sweep as plain lane arrays: for each tap, one broadcast
+    // of x[j] and one window of y, fused into eight per-lag sums. Each lag
+    // keeps the old kernel's order exactly (even taps in `s1`, odd taps in
+    // `s2`, fused multiply-adds in tap order, then `s1 + s2`), so results are
+    // bit-identical while LLVM gets 256-bit vectors without shuffles.
+    use crate::simd::lanes::fmadd;
+    #[inline(always)]
+    fn tap(acc: &mut [f32; 8], xj: f32, w: &[f32; 8]) {
+        for l in 0..8 {
+            acc[l] = fmadd(xj, w[l], acc[l]);
+        }
+    }
+    let x = &x[..len];
     let mut i = 0;
+    while i + 8 <= max_pitch {
+        let yw = &y[i..i + len + 7];
+        let mut s1 = [0.0f32; 8];
+        let mut s2 = [0.0f32; 8];
+        let (pairs, odd) = x.as_chunks::<2>();
+        for (p, xp) in pairs.iter().enumerate() {
+            let j = 2 * p;
+            // `yw` holds len + 7 samples and j + 1 < len, so both windows
+            // exist; the `if let` only spells that out to the compiler.
+            if let (Some(w0), Some(w1)) =
+                (yw[j..].first_chunk::<8>(), yw[j + 1..].first_chunk::<8>())
+            {
+                tap(&mut s1, xp[0], w0);
+                tap(&mut s2, xp[1], w1);
+            }
+        }
+        if let Some(&xj) = odd.first() {
+            let j = len - 1;
+            if let Some(w) = yw[j..].first_chunk::<8>() {
+                tap(&mut s1, xj, w);
+            }
+        }
+        for l in 0..8 {
+            xcorr[i + l] = s1[l] + s2[l];
+        }
+        i += 8;
+    }
 
     while i + 4 <= max_pitch {
         let mut sum = [0.0f32; 4];
