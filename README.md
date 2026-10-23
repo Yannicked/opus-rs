@@ -128,6 +128,13 @@ Measured on Apple Silicon M-series (aarch64), compiled with `--release` (opt-lev
 
 ### Unreleased
 
+- **Fix: 10 ms SILK frames decode like libopus.** `silk_decoder_set_fs`
+  forced four subframes before picking the pitch contour table, so 10 ms
+  frames read their contour with the 20 ms table: the first voiced 10 ms
+  frame desynced the range decoder, and 10 ms SILK streams decoded to noise
+  (-7 dB against libopus). The caller's subframe count now picks the table,
+  as in libopus; 10 ms NB/MB/WB, mono and stereo, decode bit-exact (~274 dB).
+
 ### 0.1.39
 
 - **Fix: a SILK-only frame's trailing redundancy now decodes, like libopus
