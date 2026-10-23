@@ -838,15 +838,14 @@ fn comb_filter_const(
         comb_filter_const_neon(y, x, y_idx, x_idx, t, n, g10, g11, g12);
     }
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    unsafe {
-        if crate::compat::x86_has_avx_fma() {
-            comb_filter_const_avx(y, x, y_idx, x_idx, t, n, g10, g11, g12);
-            return;
-        }
+    if crate::compat::x86_has_avx_fma() {
+        // SAFETY: the CPU supports AVX and FMA, checked just above.
+        unsafe { comb_filter_const_avx_fma(y, x, y_idx, x_idx, t, n, g10, g11, g12) };
+        return;
     }
     #[cfg(all(target_arch = "x86_64", target_feature = "sse"))]
-    unsafe {
-        comb_filter_const_sse(y, x, y_idx, x_idx, t, n, g10, g11, g12);
+    {
+        comb_filter_const_body::<false>(y, x, y_idx, x_idx, t, n, g10, g11, g12);
         #[allow(clippy::needless_return)]
         return;
     }
@@ -893,6 +892,69 @@ fn comb_filter_const_scalar(
     }
 }
 
+/// The constant-gain comb filter as plain code the compiler vectorizes: SSE
+/// on any x86_64, AVX+FMA through [`comb_filter_const_avx_fma`]. Groups of
+/// four outputs use the same arithmetic as the intrinsics kernels this
+/// replaces (fused multiply-adds when `FMA`), and the last `n % 4` outputs
+/// the scalar formula, so results are bit-identical to them.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+use crate::simd::lanes::fmadd;
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+fn comb_filter_const_body<const FMA: bool>(
+    y: &mut [f32],
+    x: &[f32],
+    y_idx: usize,
+    x_idx: usize,
+    t: usize,
+    n: usize,
+    g10: f32,
+    g11: f32,
+    g12: f32,
+) {
+    // xs[j] = x[x_idx - t - 2 + j]: every tap the filter reads.
+    let xs = &x[x_idx - t - 2..x_idx + n];
+    let ys = &mut y[y_idx..y_idx + n];
+    let n4 = n & !3;
+    let (xi_all, taps) = (&xs[t + 2..], &xs[..n + 4]);
+    for (i, yv) in ys[..n4].iter_mut().enumerate() {
+        let xi = xi_all[i];
+        let x2 = taps[i + 2];
+        let x1x3 = taps[i + 1] + taps[i + 3];
+        let x0x4 = taps[i] + taps[i + 4];
+        *yv = if FMA {
+            fmadd(g12, x0x4, fmadd(g11, x1x3, fmadd(g10, x2, xi)))
+        } else {
+            (xi + g10 * x2) + (g11 * x1x3 + g12 * x0x4)
+        };
+    }
+    for i in n4..n {
+        ys[i] = xi_all[i]
+            + g10 * taps[i + 2]
+            + g11 * (taps[i + 3] + taps[i + 1])
+            + g12 * (taps[i + 4] + taps[i]);
+    }
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "avx,fma")]
+#[allow(clippy::too_many_arguments)]
+fn comb_filter_const_avx_fma(
+    y: &mut [f32],
+    x: &[f32],
+    y_idx: usize,
+    x_idx: usize,
+    t: usize,
+    n: usize,
+    g10: f32,
+    g11: f32,
+    g12: f32,
+) {
+    comb_filter_const_body::<true>(y, x, y_idx, x_idx, t, n, g10, g11, g12);
+}
+
 #[cfg(target_arch = "aarch64")]
 fn comb_filter_const_neon(
     y: &mut [f32],
@@ -905,13 +967,14 @@ fn comb_filter_const_neon(
     g11: f32,
     g12: f32,
 ) {
+    // SAFETY: NEON is part of the aarch64 baseline.
     unsafe { comb_filter_const_neon_impl(y, x, y_idx, x_idx, t, n, g10, g11, g12) }
 }
 
 #[cfg(target_arch = "aarch64")]
-#[inline(always)]
-#[allow(unsafe_op_in_unsafe_fn)]
-unsafe fn comb_filter_const_neon_impl(
+#[inline]
+#[target_feature(enable = "neon")]
+fn comb_filter_const_neon_impl(
     y: &mut [f32],
     x: &[f32],
     y_idx: usize,
@@ -922,20 +985,22 @@ unsafe fn comb_filter_const_neon_impl(
     g11: f32,
     g12: f32,
 ) {
+    use crate::simd::neon::{ld4, st4};
     use core::arch::aarch64::*;
 
     let g10v = vdupq_n_f32(g10);
     let g11v = vdupq_n_f32(g11);
     let g12v = vdupq_n_f32(g12);
 
-    let xbase = x.as_ptr().add(x_idx);
-    let ybase = y.as_mut_ptr().add(y_idx);
+    // xs[j] = x[x_idx - t - 2 + j]: every tap the filter reads.
+    let xs = &x[x_idx - t - 2..x_idx + n];
+    let ys = &mut y[y_idx..y_idx + n];
 
-    let mut x0v = vld1q_f32(xbase.sub(t + 2));
+    let mut x0v = ld4(xs, 0);
 
     let mut i = 0;
     while i + 4 <= n {
-        let x4v = vld1q_f32(xbase.add(i).sub(t - 2));
+        let x4v = ld4(xs, i + 4);
 
         let x2v = vextq_f32(x0v, x4v, 2);
 
@@ -943,260 +1008,25 @@ unsafe fn comb_filter_const_neon_impl(
 
         let x3v = vextq_f32(x0v, x4v, 3);
 
-        let xi = vld1q_f32(xbase.add(i));
+        let xi = ld4(xs, t + 2 + i);
 
         let mut yi = xi;
         yi = vfmaq_f32(yi, g10v, x2v);
         yi = vfmaq_f32(yi, g11v, vaddq_f32(x1v, x3v));
         yi = vfmaq_f32(yi, g12v, vaddq_f32(x4v, x0v));
-        vst1q_f32(ybase.add(i), yi);
+        st4(ys, i, yi);
 
         x0v = x4v;
         i += 4;
     }
 
-    let x0v_arr: [f32; 4] = core::mem::transmute(x0v);
+    let mut x0v_arr = [0.0f32; 4];
+    st4(&mut x0v_arr, 0, x0v);
     let mut sx4 = x0v_arr[0];
     let mut sx3 = x0v_arr[1];
     let mut sx2 = x0v_arr[2];
     let mut sx1 = x0v_arr[3];
 
-    while i < n {
-        let sx0 = x[x_idx + i - t + 2];
-        y[y_idx + i] = x[x_idx + i] + g10 * sx2 + g11 * (sx1 + sx3) + g12 * (sx0 + sx4);
-        sx4 = sx3;
-        sx3 = sx2;
-        sx2 = sx1;
-        sx1 = sx0;
-        i += 1;
-    }
-}
-
-#[cfg(all(target_arch = "x86_64", target_feature = "sse"))]
-#[inline(always)]
-#[allow(unsafe_op_in_unsafe_fn)]
-unsafe fn comb_filter_const_sse(
-    y: &mut [f32],
-    x: &[f32],
-    y_idx: usize,
-    x_idx: usize,
-    t: usize,
-    n: usize,
-    g10: f32,
-    g11: f32,
-    g12: f32,
-) {
-    #[cfg(target_arch = "x86")]
-    use core::arch::x86::*;
-    #[cfg(target_arch = "x86_64")]
-    use core::arch::x86_64::*;
-
-    let g10v = _mm_set1_ps(g10);
-    let g11v = _mm_set1_ps(g11);
-    let g12v = _mm_set1_ps(g12);
-
-    let xbase = x.as_ptr().add(x_idx);
-    let ybase = y.as_mut_ptr().add(y_idx);
-    let mut x0v = _mm_loadu_ps(xbase.sub(t + 2));
-
-    let mut i = 0;
-    while i + 4 <= n {
-        let x4v = _mm_loadu_ps(xbase.add(i).sub(t - 2));
-
-        let x2v = _mm_shuffle_ps(x0v, x4v, 0x4e);
-
-        let x1v = _mm_shuffle_ps(x0v, x2v, 0x99);
-
-        let x3v = _mm_shuffle_ps(x2v, x4v, 0x99);
-
-        let xi = _mm_loadu_ps(xbase.add(i));
-
-        let mut yi = xi;
-        yi = _mm_add_ps(yi, _mm_mul_ps(g10v, x2v));
-        let yi2 = _mm_add_ps(
-            _mm_mul_ps(g11v, _mm_add_ps(x3v, x1v)),
-            _mm_mul_ps(g12v, _mm_add_ps(x4v, x0v)),
-        );
-        yi = _mm_add_ps(yi, yi2);
-        _mm_storeu_ps(ybase.add(i), yi);
-
-        x0v = x4v;
-        i += 4;
-    }
-
-    let x0v_arr: [f32; 4] = core::mem::transmute(x0v);
-    let mut sx4 = x0v_arr[0];
-    let mut sx3 = x0v_arr[1];
-    let mut sx2 = x0v_arr[2];
-    let mut sx1 = x0v_arr[3];
-
-    while i < n {
-        let sx0 = x[x_idx + i - t + 2];
-        y[y_idx + i] = x[x_idx + i] + g10 * sx2 + g11 * (sx1 + sx3) + g12 * (sx0 + sx4);
-        sx4 = sx3;
-        sx3 = sx2;
-        sx2 = sx1;
-        sx1 = sx0;
-        i += 1;
-    }
-}
-
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-#[target_feature(enable = "avx,fma")]
-#[allow(unsafe_op_in_unsafe_fn)]
-unsafe fn comb_filter_const_avx(
-    y: &mut [f32],
-    x: &[f32],
-    y_idx: usize,
-    x_idx: usize,
-    t: usize,
-    n: usize,
-    g10: f32,
-    g11: f32,
-    g12: f32,
-) {
-    #[cfg(target_arch = "x86")]
-    use core::arch::x86::*;
-    #[cfg(target_arch = "x86_64")]
-    use core::arch::x86_64::*;
-
-    let g10v = _mm256_set1_ps(g10);
-    let g11v = _mm256_set1_ps(g11);
-    let g12v = _mm256_set1_ps(g12);
-
-    let xbase = x.as_ptr().add(x_idx);
-    let ybase = y.as_mut_ptr().add(y_idx);
-
-    let mut i = 0;
-
-    while i + 16 <= n {
-        let xi_a = _mm256_loadu_ps(xbase.add(i));
-        let x0_a = _mm256_loadu_ps(xbase.add(i).sub(t + 2));
-        let x4_a = _mm256_loadu_ps(xbase.add(i).sub(t - 2));
-
-        let x2_a = _mm256_loadu_ps(xbase.add(i).sub(t));
-        let x1x3_a = _mm256_add_ps(
-            _mm256_loadu_ps(xbase.add(i).sub(t + 1)),
-            _mm256_loadu_ps(xbase.add(i).sub(t - 1)),
-        );
-        let x0x4_a = _mm256_add_ps(x0_a, x4_a);
-
-        let mut yi_a = xi_a;
-        yi_a = _mm256_fmadd_ps(g10v, x2_a, yi_a);
-        yi_a = _mm256_fmadd_ps(g11v, x1x3_a, yi_a);
-        yi_a = _mm256_fmadd_ps(g12v, x0x4_a, yi_a);
-        _mm256_storeu_ps(ybase.add(i), yi_a);
-
-        let j = i + 8;
-        let xi_b = _mm256_loadu_ps(xbase.add(j));
-        let x0_b = _mm256_loadu_ps(xbase.add(j).sub(t + 2));
-        let x4_b = _mm256_loadu_ps(xbase.add(j).sub(t - 2));
-        let x2_b = _mm256_loadu_ps(xbase.add(j).sub(t));
-        let x1x3_b = _mm256_add_ps(
-            _mm256_loadu_ps(xbase.add(j).sub(t + 1)),
-            _mm256_loadu_ps(xbase.add(j).sub(t - 1)),
-        );
-        let x0x4_b = _mm256_add_ps(x0_b, x4_b);
-
-        let mut yi_b = xi_b;
-        yi_b = _mm256_fmadd_ps(g10v, x2_b, yi_b);
-        yi_b = _mm256_fmadd_ps(g11v, x1x3_b, yi_b);
-        yi_b = _mm256_fmadd_ps(g12v, x0x4_b, yi_b);
-        _mm256_storeu_ps(ybase.add(j), yi_b);
-
-        i += 16;
-    }
-
-    while i + 8 <= n {
-        let xi = _mm256_loadu_ps(xbase.add(i));
-        let x0 = _mm256_loadu_ps(xbase.add(i).sub(t + 2));
-        let x4 = _mm256_loadu_ps(xbase.add(i).sub(t - 2));
-        let x2 = _mm256_loadu_ps(xbase.add(i).sub(t));
-        let x1x3 = _mm256_add_ps(
-            _mm256_loadu_ps(xbase.add(i).sub(t + 1)),
-            _mm256_loadu_ps(xbase.add(i).sub(t - 1)),
-        );
-        let x0x4 = _mm256_add_ps(x0, x4);
-
-        let mut yi = xi;
-        yi = _mm256_fmadd_ps(g10v, x2, yi);
-        yi = _mm256_fmadd_ps(g11v, x1x3, yi);
-        yi = _mm256_fmadd_ps(g12v, x0x4, yi);
-        _mm256_storeu_ps(ybase.add(i), yi);
-
-        i += 8;
-    }
-
-    if i + 4 <= n {
-        comb_filter_const_sse_fma(y, x, y_idx + i, x_idx + i, t, n - i, g10, g11, g12);
-        return;
-    }
-
-    let mut sx4 = x[x_idx + i - t - 2];
-    let mut sx3 = x[x_idx + i - t - 1];
-    let mut sx2 = x[x_idx + i - t];
-    let mut sx1 = x[x_idx + i - t + 1];
-    while i < n {
-        let sx0 = x[x_idx + i - t + 2];
-        y[y_idx + i] = x[x_idx + i] + g10 * sx2 + g11 * (sx1 + sx3) + g12 * (sx0 + sx4);
-        sx4 = sx3;
-        sx3 = sx2;
-        sx2 = sx1;
-        sx1 = sx0;
-        i += 1;
-    }
-}
-
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-#[target_feature(enable = "avx,fma")]
-#[allow(unsafe_op_in_unsafe_fn)]
-unsafe fn comb_filter_const_sse_fma(
-    y: &mut [f32],
-    x: &[f32],
-    y_idx: usize,
-    x_idx: usize,
-    t: usize,
-    n: usize,
-    g10: f32,
-    g11: f32,
-    g12: f32,
-) {
-    #[cfg(target_arch = "x86")]
-    use core::arch::x86::*;
-    #[cfg(target_arch = "x86_64")]
-    use core::arch::x86_64::*;
-
-    let g10v = _mm_set1_ps(g10);
-    let g11v = _mm_set1_ps(g11);
-    let g12v = _mm_set1_ps(g12);
-
-    let xbase = x.as_ptr().add(x_idx);
-    let ybase = y.as_mut_ptr().add(y_idx);
-    let mut x0v = _mm_loadu_ps(xbase.sub(t + 2));
-
-    let mut i = 0;
-    while i + 4 <= n {
-        let x4v = _mm_loadu_ps(xbase.add(i).sub(t - 2));
-        let x2v = _mm_shuffle_ps(x0v, x4v, 0x4e);
-        let x1v = _mm_shuffle_ps(x0v, x2v, 0x99);
-        let x3v = _mm_shuffle_ps(x2v, x4v, 0x99);
-        let xi = _mm_loadu_ps(xbase.add(i));
-
-        let mut yi = xi;
-        yi = _mm_fmadd_ps(g10v, x2v, yi);
-        yi = _mm_fmadd_ps(g11v, _mm_add_ps(x1v, x3v), yi);
-        yi = _mm_fmadd_ps(g12v, _mm_add_ps(x0v, x4v), yi);
-        _mm_storeu_ps(ybase.add(i), yi);
-
-        x0v = x4v;
-        i += 4;
-    }
-
-    let x0v_arr: [f32; 4] = core::mem::transmute(x0v);
-    let mut sx4 = x0v_arr[0];
-    let mut sx3 = x0v_arr[1];
-    let mut sx2 = x0v_arr[2];
-    let mut sx1 = x0v_arr[3];
     while i < n {
         let sx0 = x[x_idx + i - t + 2];
         y[y_idx + i] = x[x_idx + i] + g10 * sx2 + g11 * (sx1 + sx3) + g12 * (sx0 + sx4);

@@ -8,6 +8,23 @@
 //! `#[target_feature]` function. The slicing is cheap, and the compiler drops
 //! it altogether when the loop bound already proves the vector is in range.
 
+/// Plain-Rust building blocks for kernels that let the compiler vectorize.
+///
+/// Compiled inside a `#[target_feature]` function, code written with these
+/// gets the same vector instructions the hand-written intrinsics used, while
+/// keeping their exact arithmetic, so results stay bit-identical.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+pub(crate) mod lanes {
+    #[cfg(not(feature = "std"))]
+    use crate::compat::Math;
+
+    /// `a * b + c` with a single rounding, as `_mm256_fmadd_ps` computes it.
+    #[inline(always)]
+    pub(crate) fn fmadd(a: f32, b: f32, c: f32) -> f32 {
+        a.mul_add(b, c)
+    }
+}
+
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 pub(crate) mod x86 {
     #[cfg(target_arch = "x86")]
