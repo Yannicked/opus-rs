@@ -133,12 +133,7 @@ pub fn celt_pvq_u_lookup(n: u32, k: u32) -> u32 {
     if c > CELT_PVQ_U_CMAX[r] {
         return compute_u(n, k);
     }
-    unsafe {
-        let row_base = *CELT_PVQ_U_ROW.get_unchecked(r);
-        let idx = row_base as usize + c;
-        debug_assert!(idx < CELT_PVQ_U_DATA.len());
-        *CELT_PVQ_U_DATA.get_unchecked(idx)
-    }
+    CELT_PVQ_U_DATA[CELT_PVQ_U_ROW[r] as usize + c]
 }
 
 pub fn ncwrs(n: u32, k: u32) -> u32 {

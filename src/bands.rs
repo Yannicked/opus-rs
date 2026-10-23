@@ -939,12 +939,11 @@ fn quant_partition_encode(
     // Check split condition FIRST (matching C's quant_partition which checks this before dispatch)
     let should_split = if lm >= 0 && n > 2 {
         let cache_idx = (lm + 1) as usize * ctx.m.nb_ebands + ctx.i;
-        let cache_base = unsafe { *ctx.m.cache.index.get_unchecked(cache_idx) };
+        let cache_base = ctx.m.cache.index[cache_idx];
         if cache_base >= 0 {
-            let cache_base = cache_base as usize;
-            let cache_ptr = ctx.m.cache.bits.as_ptr().wrapping_add(cache_base);
-            let max_q = unsafe { *cache_ptr } as usize;
-            b > (unsafe { *cache_ptr.add(max_q) } as i32) + 12
+            let cache = &ctx.m.cache.bits[cache_base as usize..];
+            let max_q = cache[0] as usize;
+            b > (cache[max_q] as i32) + 12
         } else {
             false
         }
@@ -1153,12 +1152,11 @@ pub fn quant_partition(
     This matches the C code which checks this at the top of quant_partition. */
     let should_split = if lm >= 0 && n > 2 {
         let cache_idx = (lm + 1) as usize * ctx.m.nb_ebands + ctx.i;
-        let cache_base = unsafe { *ctx.m.cache.index.get_unchecked(cache_idx) };
+        let cache_base = ctx.m.cache.index[cache_idx];
         if cache_base >= 0 {
-            let cache_base = cache_base as usize;
-            let cache_ptr = ctx.m.cache.bits.as_ptr().wrapping_add(cache_base);
-            let max_q = unsafe { *cache_ptr } as usize;
-            b > (unsafe { *cache_ptr.add(max_q) } as i32) + 12
+            let cache = &ctx.m.cache.bits[cache_base as usize..];
+            let max_q = cache[0] as usize;
+            b > (cache[max_q] as i32) + 12
         } else {
             false
         }
