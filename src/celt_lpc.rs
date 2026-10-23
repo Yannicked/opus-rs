@@ -75,8 +75,9 @@ pub fn autocorr(
 
 pub fn celt_fir(x: &[f32], num: &[f32], y: &mut [f32], n: usize, ord: usize) {
     #[cfg(target_arch = "aarch64")]
+    // SAFETY: NEON is part of the aarch64 baseline.
     unsafe {
-        celt_fir_neon(x, num, y, n, ord);
+        celt_fir_neon(x, num, y, n, ord)
     }
     #[cfg(not(target_arch = "aarch64"))]
     {
@@ -94,8 +95,9 @@ pub fn celt_fir(x: &[f32], num: &[f32], y: &mut [f32], n: usize, ord: usize) {
 
 pub fn celt_iir(x: &[f32], den: &[f32], y: &mut [f32], n: usize, ord: usize, mem: &mut [f32]) {
     #[cfg(target_arch = "aarch64")]
+    // SAFETY: NEON is part of the aarch64 baseline.
     unsafe {
-        celt_iir_neon(x, den, y, n, ord, mem);
+        celt_iir_neon(x, den, y, n, ord, mem)
     }
     #[cfg(not(target_arch = "aarch64"))]
     {
@@ -114,9 +116,10 @@ pub fn celt_iir(x: &[f32], den: &[f32], y: &mut [f32], n: usize, ord: usize, mem
 }
 
 #[cfg(target_arch = "aarch64")]
-#[inline(always)]
-#[allow(unsafe_op_in_unsafe_fn)]
-unsafe fn celt_fir_neon(x: &[f32], num: &[f32], y: &mut [f32], n: usize, ord: usize) {
+#[inline]
+#[target_feature(enable = "neon")]
+fn celt_fir_neon(x: &[f32], num: &[f32], y: &mut [f32], n: usize, ord: usize) {
+    use crate::simd::neon::ld4;
     use core::arch::aarch64::*;
 
     if ord < 4 {
@@ -137,8 +140,8 @@ unsafe fn celt_fir_neon(x: &[f32], num: &[f32], y: &mut [f32], n: usize, ord: us
 
         let mut j = 0;
         while j + 4 <= ord && i > j + 3 {
-            let coeff = vld1q_f32(num.as_ptr().add(j));
-            let x_vals = vld1q_f32(x.as_ptr().add(i - j - 4));
+            let coeff = ld4(num, j);
+            let x_vals = ld4(x, i - j - 4);
             let x_reversed = vrev64q_f32(x_vals);
             let x_reversed = vextq_f32(x_reversed, x_reversed, 2);
             sum = vfmaq_f32(sum, coeff, x_reversed);
@@ -162,16 +165,10 @@ unsafe fn celt_fir_neon(x: &[f32], num: &[f32], y: &mut [f32], n: usize, ord: us
 }
 
 #[cfg(target_arch = "aarch64")]
-#[inline(always)]
-#[allow(unsafe_op_in_unsafe_fn)]
-unsafe fn celt_iir_neon(
-    x: &[f32],
-    den: &[f32],
-    y: &mut [f32],
-    n: usize,
-    ord: usize,
-    mem: &mut [f32],
-) {
+#[inline]
+#[target_feature(enable = "neon")]
+fn celt_iir_neon(x: &[f32], den: &[f32], y: &mut [f32], n: usize, ord: usize, mem: &mut [f32]) {
+    use crate::simd::neon::ld4;
     use core::arch::aarch64::*;
 
     if ord < 4 {
@@ -194,8 +191,8 @@ unsafe fn celt_iir_neon(
 
         let mut j = 0;
         while j + 4 <= ord {
-            let coeff = vld1q_f32(den.as_ptr().add(j));
-            let mem_vals = vld1q_f32(mem.as_ptr().add(j));
+            let coeff = ld4(den, j);
+            let mem_vals = ld4(mem, j);
             feedback = vfmaq_f32(feedback, coeff, mem_vals);
             j += 4;
         }
